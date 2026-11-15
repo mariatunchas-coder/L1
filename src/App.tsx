@@ -62,6 +62,30 @@ interface Settings {
   props: boolean;
   modelFit: number;
   modelLights: boolean;
+  // awan
+  clouds: number;
+  cloudDensity: number;
+  cloudScale: number;
+  cloudDrift: boolean;
+  // efek baru
+  contact: boolean;
+  contactLength: number;
+  contactStrength: number;
+  flare: boolean;
+  flareIntensity: number;
+  flareThreshold: number;
+  flareGhosts: number;
+  lensDistortion: number;
+  look: string;
+  // air kolam
+  waterWaves: number;
+  waterScale: number;
+  waterSpeed: number;
+  waterClarity: number;
+  waterColor: string;
+  // performa adaptif
+  adaptive: boolean;
+  adaptiveFps: number;
 }
 
 const DEFAULTS: Settings = {
@@ -80,7 +104,7 @@ const DEFAULTS: Settings = {
   volFogIntensity: 1,
   exposure: 1,
   autoExposure: true,
-  tone: 'aces',
+  tone: 'agx',
   bloom: true,
   bloomIntensity: 0.12,
   msaa: 4,
@@ -116,9 +140,29 @@ const DEFAULTS: Settings = {
   props: true,
   modelFit: 5,
   modelLights: true,
+  clouds: 0.35,
+  cloudDensity: 1,
+  cloudScale: 2.2,
+  cloudDrift: false,
+  contact: true,
+  contactLength: 0.7,
+  contactStrength: 0.85,
+  flare: false,
+  flareIntensity: 0.2,
+  flareThreshold: 8,
+  flareGhosts: 5,
+  lensDistortion: 0,
+  look: 'none',
+  waterWaves: 0.035,
+  waterScale: 1,
+  waterSpeed: 1,
+  waterClarity: 2.2,
+  waterColor: '#3aa7a8',
+  adaptive: false,
+  adaptiveFps: 58,
 };
 
-const STORAGE_KEY = 'lumina.settings.v2';
+const STORAGE_KEY = 'lumina.settings.v3';
 
 /** Merges untrusted JSON into the defaults, keeping only keys of the right type. */
 function sanitize(raw: unknown): Settings {
@@ -140,11 +184,21 @@ function loadSettings(): Settings {
 }
 
 const QUALITY: { name: string; patch: Partial<Settings> }[] = [
-  { name: 'Rendah', patch: { msaa: 0, taa: false, ssao: false, ssr: false, dof: false, mb: false, shadowSize: 1024, cascades: 2, scale: 0.75, volFog: false, bloom: true, sharpen: 0 } },
-  { name: 'Sedang', patch: { msaa: 2, taa: false, ssao: true, ssr: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0 } },
-  { name: 'Tinggi', patch: { msaa: 0, taa: true, ssao: true, ssr: true, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0.25 } },
-  { name: 'Ultra', patch: { msaa: 4, taa: true, ssao: true, ssr: true, dof: false, mb: true, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.25 } },
+  { name: 'Rendah', patch: { msaa: 0, taa: false, ssao: false, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 1024, cascades: 2, scale: 0.75, volFog: false, bloom: true, sharpen: 0 } },
+  { name: 'Sedang', patch: { msaa: 2, taa: false, ssao: true, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0 } },
+  { name: 'Tinggi', patch: { msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0.25 } },
+  { name: 'Ultra', patch: { msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: true, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.25 } },
+  { name: 'Foto', patch: { msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: true, dof: true, mb: false, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.3, tone: 'agx' } },
 ];
+
+type V3 = [number, number, number];
+const LOOKS: Record<string, { slope: V3; offset: V3; power: V3 } | null> = {
+  none: null,
+  warm: { slope: [1.06, 1.0, 0.9], offset: [0.01, 0.005, -0.01], power: [0.97, 1, 1.04] },
+  teal: { slope: [1.1, 1.0, 0.86], offset: [-0.015, 0, 0.03], power: [0.94, 1, 1.1] },
+  cool: { slope: [0.95, 1.0, 1.08], offset: [0, 0, 0.01], power: [1.05, 1, 0.96] },
+  fade: { slope: [0.92, 0.92, 0.95], offset: [0.06, 0.06, 0.07], power: [1, 1, 1] },
+};
 
 const SKY_PRESETS = [
   { name: 'Siang', e: 52, a: 140 },
@@ -194,6 +248,12 @@ mixer.clipAction(gltf.animations[0]).play();
 })();`;
 
 const FEATURES: [string, string][] = [
+  ['Refraksi & transmisi nyata (baru)', 'Pass transmission: scene di belakang objek di-resolve ke mip-chain, dibelokkan sesuai IOR, diburamkan oleh roughness, diserap Beer–Lambert (kaca, cairan, kaca buram)'],
+  ['Air fotorealistik (baru)', 'Gelombang dispersi air dalam, refraksi, serapan warna berdasarkan kedalaman nyata dari depth buffer, busa tepi, tanpa kebocoran objek di depan air'],
+  ['Material berlapis (baru)', 'Sheen Charlie (beludru), anisotropy GGX (baja sikat), iridescence film tipis, subsurface wrap (lilin/kulit), IOR → F0'],
+  ['Awan prosedural volumetrik-semu (baru)', 'fBm + domain warp dengan self-shadow, silver lining; ikut di-bake ke IBL, tajam di background, menyaring matahari saat mendung'],
+  ['Bayangan kontak, lens flare, AgX, CDL (baru)', 'Ray-march depth ke arah matahari, flare ghost/halo ber-ambang, tone mapper AgX, ASC CDL, distorsi lensa'],
+  ['Optimasi (baru)', 'compile/compileAsync (pre-warm shader), AdaptiveQuality (tangga penghematan yang dapat dibalik), preset kualitas, mergeGeometries, perbaikan kebocoran resource setelah context restore'],
   ['TAA (baru)', 'Jitter Halton sub-pixel, motion vector per-objek + kamera, reproyeksi history Catmull-Rom, variance clipping, sharpen'],
   ['SSR (baru)', 'Ray-march screen-space half-res dengan binary refine, G-buffer normal/roughness/F0, menggantikan specular IBL secara akurat'],
   ['Depth of Field (baru)', 'Lensa tipis (focal length, f-stop, jarak fokus), bokeh Vogel, foreground tidak tercemar blur background'],
@@ -292,6 +352,8 @@ export default function App() {
         lights: i.lights,
         res: `${i.width}×${i.height}`,
         gpuName: r.capabilities.gpu,
+        aq: showRef.current?.adaptive.level ?? 0,
+        aqStep: showRef.current?.adaptive.lastStep ?? '',
       });
     }, 300);
     return () => {
@@ -319,7 +381,10 @@ export default function App() {
     if (!sh) return;
     const r = sh.renderer;
     const p = r.post;
+    sh.adaptive.release(); // the governor's savings must not leak into the values we are about to apply
     sh.setSun(s.elevation, s.azimuth);
+    sh.setClouds(s.clouds, s.cloudDensity, s.cloudScale);
+    sh.cloudDrift = s.cloudDrift;
     sh.fog.density = s.fog / 1000;
     p.exposure = s.exposure;
     p.autoExposure = s.autoExposure;
@@ -355,6 +420,26 @@ export default function App() {
     p.volumetricFog.heightFalloff = s.volFogHeightFalloff;
     p.volumetricFog.anisotropy = s.volFogAnisotropy;
     p.volumetricFog.intensity = s.volFogIntensity;
+    p.contactShadows.enabled = s.contact;
+    p.contactShadows.length = s.contactLength;
+    p.contactShadows.strength = s.contactStrength;
+    p.lensFlare.enabled = s.flare;
+    p.lensFlare.intensity = s.flareIntensity;
+    p.lensFlare.threshold = s.flareThreshold;
+    p.lensFlare.ghosts = s.flareGhosts;
+    p.lensDistortion = s.lensDistortion;
+    const lk = LOOKS[s.look] ?? null;
+    p.cdl.enabled = !!lk;
+    if (lk) {
+      p.cdl.slope = lk.slope;
+      p.cdl.offset = lk.offset;
+      p.cdl.power = lk.power;
+    }
+    sh.water.waves = s.waterWaves;
+    sh.water.waveScale = s.waterScale;
+    sh.water.waveSpeed = s.waterSpeed;
+    sh.water.attenuationDistance = s.waterClarity;
+    sh.water.attenuationColor.setStyle(s.waterColor);
     r.shadowsEnabled = s.shadows;
     sh.sun.shadow.mapSize = s.shadowSize;
     sh.sun.shadow.cascades = s.cascades;
@@ -368,6 +453,8 @@ export default function App() {
     sh.setPropsVisible(s.props);
     sh.setModelScale(s.modelFit);
     sh.setModelLights(s.modelLights);
+    sh.adaptive.targetFps = s.adaptiveFps;
+    sh.adaptive.enabled = s.adaptive;
   }, [s, ready]);
 
   const set = <K extends keyof Settings>(k: K, v: Settings[K]) => setS((o) => ({ ...o, [k]: v }));
@@ -453,7 +540,7 @@ export default function App() {
           </div>
           <div>
             <div className="text-sm font-semibold tracking-wide text-white drop-shadow">LUMINA</div>
-            <div className="text-[10px] uppercase tracking-[0.2em] text-slate-300/80 drop-shadow">WebGL2 · PBR · TAA · SSR · glTF</div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-slate-300/80 drop-shadow">WebGL2 · PBR · Refraksi · Air · Awan · AgX</div>
           </div>
         </div>
       </div>
@@ -492,6 +579,7 @@ export default function App() {
           <Stat k="Shadow draws" v={String(stats.sh ?? 0)} />
           <Stat k="Lampu · program" v={`${stats.lights ?? 0} · ${stats.prog ?? 0}`} />
           <Stat k="Resolusi internal" v={String(stats.res ?? '')} />
+          {s.adaptive && <Stat k="Hemat adaptif" v={Number(stats.aq) ? `L${stats.aq} · ${stats.aqStep}` : 'tidak perlu'} warn={!!Number(stats.aq)} />}
           <div className="mt-1 truncate text-[10px] text-slate-500" title={String(stats.gpuName ?? '')}>
             {String(stats.gpuName ?? '')}
           </div>
@@ -525,7 +613,7 @@ export default function App() {
           {tab === 'render' && (
             <>
               <Section title="Preset kualitas">
-                <div className="grid grid-cols-4 gap-1.5">
+                <div className="grid grid-cols-5 gap-1.5">
                   {QUALITY.map((q) => (
                     <button key={q.name} onClick={() => patch(q.patch)} className="rounded-md bg-white/5 py-1.5 text-[11px] font-medium text-slate-300 hover:bg-sky-500/30 hover:text-white">
                       {q.name}
@@ -573,13 +661,33 @@ export default function App() {
                 )}
               </Section>
 
+              <Section title="Awan prosedural">
+                <Slider label="Tutupan awan" hint="0 = cerah, 1 = mendung" value={s.clouds} min={0} max={1} step={0.01} onChange={(v) => set('clouds', v)} fmt={(v) => (v * 100).toFixed(0) + '%'} />
+                {s.clouds > 0 && (
+                  <>
+                    <Slider label="Kepadatan" value={s.cloudDensity} min={0.3} max={2.5} step={0.05} onChange={(v) => set('cloudDensity', v)} />
+                    <Slider label="Skala awan" hint="besar ↔ kecil" value={s.cloudScale} min={0.8} max={5} step={0.05} onChange={(v) => set('cloudScale', v)} />
+                    <Toggle label="Awan bergerak (angin)" value={s.cloudDrift} onChange={(v) => set('cloudDrift', v)} />
+                  </>
+                )}
+                <div className="text-[10px] text-slate-500">Awan ikut mewarnai pencahayaan &amp; pantulan, dan menyaring sinar matahari saat mendung.</div>
+              </Section>
+
+              <Section title="Air kolam (refraksi)">
+                <Slider label="Tinggi gelombang" value={s.waterWaves} min={0} max={0.12} step={0.002} onChange={(v) => set('waterWaves', v)} />
+                <Slider label="Skala riak" value={s.waterScale} min={0.4} max={3} step={0.05} onChange={(v) => set('waterScale', v)} />
+                <Slider label="Kecepatan" value={s.waterSpeed} min={0} max={3} step={0.05} onChange={(v) => set('waterSpeed', v)} fmt={(v) => '×' + v.toFixed(2)} />
+                <Slider label="Kejernihan" hint="jarak serap warna" value={s.waterClarity} min={0.3} max={12} step={0.1} onChange={(v) => set('waterClarity', v)} fmt={(v) => v.toFixed(1) + ' m'} />
+                <ColorField label="Warna air" value={s.waterColor} onChange={(h) => set('waterColor', h)} />
+              </Section>
+
               <Section title="Kamera & tone mapping">
                 <Toggle label="Auto exposure" hint="adaptasi mata" value={s.autoExposure} onChange={(v) => set('autoExposure', v)} />
                 <Slider label="Kompensasi exposure" value={s.exposure} min={0.25} max={3} step={0.01} onChange={(v) => set('exposure', v)} fmt={(v) => '×' + v.toFixed(2)} />
                 <Segmented
                   label="Tone mapper"
                   value={s.tone}
-                  options={[{ label: 'ACES', value: 'aces' }, { label: 'Neutral', value: 'neutral' }, { label: 'Filmic', value: 'filmic' }, { label: 'Reinhard', value: 'reinhard' }, { label: 'Linear', value: 'none' }]}
+                  options={[{ label: 'AgX', value: 'agx' }, { label: 'ACES', value: 'aces' }, { label: 'Neutral', value: 'neutral' }, { label: 'Filmic', value: 'filmic' }, { label: 'Reinhard', value: 'reinhard' }, { label: 'Linear', value: 'none' }]}
                   onChange={(v) => set('tone', v as ToneMapping)}
                 />
                 <Toggle label="Bloom" value={s.bloom} onChange={(v) => set('bloom', v)} />
@@ -598,6 +706,8 @@ export default function App() {
 
               <Section title="Performa">
                 <Segmented label="MSAA" value={s.msaa} options={[{ label: 'Off', value: 0 }, { label: '2×', value: 2 }, { label: '4×', value: 4 }]} onChange={(v) => set('msaa', v)} />
+                <Toggle label="Kualitas adaptif" hint="efek dikurangi otomatis bila lambat" value={s.adaptive} onChange={(v) => set('adaptive', v)} />
+                {s.adaptive && <Slider label="Target FPS" value={s.adaptiveFps} min={24} max={120} step={1} onChange={(v) => set('adaptiveFps', v)} fmt={(v) => v.toFixed(0)} />}
                 <Toggle label="Dynamic resolution" hint="otomatis" value={s.dynRes} onChange={(v) => set('dynRes', v)} />
                 {!s.dynRes && <Slider label="Render scale" value={s.scale} min={0.4} max={1} step={0.05} onChange={(v) => set('scale', v)} fmt={(v) => (v * 100).toFixed(0) + '%'} />}
                 <Segmented
@@ -658,6 +768,37 @@ export default function App() {
               <Section title="Motion blur">
                 <Toggle label="Aktifkan motion blur" hint="objek & kamera" value={s.mb} onChange={(v) => set('mb', v)} />
                 {s.mb && <Slider label="Intensitas shutter" value={s.mbIntensity} min={0.1} max={2} step={0.05} onChange={(v) => set('mbIntensity', v)} />}
+              </Section>
+
+              <Section title="Bayangan kontak (screen-space)">
+                <Toggle label="Aktifkan" hint="mendasari objek kecil" value={s.contact} onChange={(v) => set('contact', v)} />
+                {s.contact && (
+                  <>
+                    <Slider label="Panjang ray" value={s.contactLength} min={0.1} max={2} step={0.05} onChange={(v) => set('contactLength', v)} fmt={(v) => v.toFixed(2) + ' m'} />
+                    <Slider label="Kekuatan" value={s.contactStrength} min={0} max={1} step={0.01} onChange={(v) => set('contactStrength', v)} />
+                  </>
+                )}
+              </Section>
+
+              <Section title="Lensa & flare">
+                <Toggle label="Lens flare" hint="hanya sumber cahaya terang" value={s.flare} onChange={(v) => set('flare', v)} />
+                {s.flare && (
+                  <>
+                    <Slider label="Intensitas" value={s.flareIntensity} min={0} max={1.5} step={0.01} onChange={(v) => set('flareIntensity', v)} />
+                    <Slider label="Ambang kecerahan" value={s.flareThreshold} min={1} max={60} step={0.5} onChange={(v) => set('flareThreshold', v)} />
+                    <Segmented label="Jumlah ghost" value={s.flareGhosts} options={[{ label: '2', value: 2 }, { label: '4', value: 4 }, { label: '5', value: 5 }, { label: '8', value: 8 }]} onChange={(v) => set('flareGhosts', v)} />
+                  </>
+                )}
+                <Slider label="Distorsi lensa" hint="barrel ↔ pincushion" value={s.lensDistortion} min={-0.1} max={0.1} step={0.002} onChange={(v) => set('lensDistortion', v)} />
+              </Section>
+
+              <Section title="Look sinematik (CDL)">
+                <Segmented
+                  label="Gradasi warna"
+                  value={s.look}
+                  options={[{ label: 'Netral', value: 'none' }, { label: 'Hangat', value: 'warm' }, { label: 'Teal', value: 'teal' }, { label: 'Dingin', value: 'cool' }, { label: 'Pudar', value: 'fade' }]}
+                  onChange={(v) => set('look', v)}
+                />
               </Section>
 
               <Section title="Color grading" defaultOpen={false}>
@@ -787,6 +928,19 @@ export default function App() {
                   <Slider label="Env reflection" value={mat.envMapIntensity} min={0} max={3} step={0.01} onChange={(v) => { mat.envMapIntensity = v; bump(); }} />
                   {mat.normalMap && <Slider label="Kekuatan normal map" value={mat.normalScale} min={0} max={3} step={0.01} onChange={(v) => { mat.normalScale = v; bump(); }} />}
                   {mat.transparent && <Slider label="Opasitas" value={mat.opacity} min={0.02} max={1} step={0.01} onChange={(v) => { mat.opacity = v; bump(); }} />}
+                  <div className="pt-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">Lapisan fotorealistik</div>
+                  <Slider label="IOR" value={mat.ior} min={1} max={2.5} step={0.01} onChange={(v) => { mat.ior = v; bump(); }} />
+                  <Slider label="Transmisi (refraksi)" value={mat.transmission} min={0} max={1} step={0.01} onChange={(v) => { mat.transmission = v; bump(); }} />
+                  {mat.transmission > 0 && <Slider label="Ketebalan volume" value={mat.thickness} min={0} max={4} step={0.02} onChange={(v) => { mat.thickness = v; bump(); }} fmt={(v) => v.toFixed(2) + ' m'} />}
+                  <Slider label="Sheen (kain)" value={mat.sheen} min={0} max={1} step={0.01} onChange={(v) => { mat.sheen = v; bump(); }} />
+                  {mat.sheen > 0 && <Slider label="Sheen roughness" value={mat.sheenRoughness} min={0} max={1} step={0.01} onChange={(v) => { mat.sheenRoughness = v; bump(); }} />}
+                  <Slider label="Anisotropy" hint="baja sikat" value={mat.anisotropy} min={-1} max={1} step={0.01} onChange={(v) => { mat.anisotropy = v; bump(); }} />
+                  {mat.anisotropy !== 0 && <Slider label="Rotasi anisotropy" value={mat.anisotropyRotation} min={0} max={3.1416} step={0.01} onChange={(v) => { mat.anisotropyRotation = v; bump(); }} fmt={(v) => ((v * 180) / Math.PI).toFixed(0) + '°'} />}
+                  <Slider label="Iridescence" hint="lapisan tipis" value={mat.iridescence} min={0} max={1} step={0.01} onChange={(v) => { mat.iridescence = v; bump(); }} />
+                  {mat.iridescence > 0 && <Slider label="Tebal film" value={mat.iridescenceThickness} min={80} max={900} step={5} onChange={(v) => { mat.iridescenceThickness = v; bump(); }} fmt={(v) => v.toFixed(0) + ' nm'} />}
+                  <Slider label="Subsurface (lilin/kulit)" value={mat.subsurface} min={0} max={1} step={0.01} onChange={(v) => { mat.subsurface = v; bump(); }} />
+                  {mat.subsurface > 0 && <ColorField label="Warna subsurface" value={mat.subsurfaceColor.getHexString()} onChange={(h) => { mat.subsurfaceColor.setStyle(h); bump(); }} />}
+                  {mat.waves > 0 && <Slider label="Gelombang air" value={mat.waves} min={0} max={0.12} step={0.002} onChange={(v) => { mat.waves = v; bump(); }} />}
                 </>
               )}
             </Section>

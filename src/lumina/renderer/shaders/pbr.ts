@@ -52,6 +52,9 @@ export const pbrFrag = /* glsl */ `
 #include <ubo_camera>
 #include <ubo_lights>
 #include <brdf>
+#if defined(USE_CONTACT) || defined(USE_WATER)
+#include <depth_util>
+#endif
 
 in vec3 vWorldPos;
 in vec3 vNormal;
@@ -70,6 +73,33 @@ uniform float uEnvIntensity;
 uniform vec4 uUvTransform;
 uniform float uAlphaCutoff;
 uniform float uAoStrength;
+uniform vec2 uSpec;          // x = dielectric F0 (from IOR), y = specular intensity
+#ifdef USE_SHEEN
+uniform vec4 uSheen;         // rgb = sheen colour * strength, a = sheen roughness
+#endif
+#ifdef USE_ANISO
+uniform vec4 uAniso;         // x = anisotropy (-1..1), y = cos(rot), z = sin(rot)
+#endif
+#ifdef USE_IRIDESCENCE
+uniform vec4 uIrid;          // x = strength, y = film IOR, z = thickness (nm)
+#endif
+#ifdef USE_SSS
+uniform vec4 uSSS;           // rgb = scatter colour, a = strength
+#endif
+#ifdef USE_TRANSMISSION
+uniform vec4 uTrans;         // x = transmission, y = thickness (m), z = unused, w = IOR
+uniform vec3 uAttCoeff;      // Beer-Lambert absorption coefficient (1/m)
+uniform sampler2D uTransmissionTex;
+#endif
+#ifdef USE_WATER
+uniform vec4 uWave;          // x = amplitude, y = scale, z = speed
+#endif
+#if defined(USE_CONTACT) || defined(USE_WATER)
+uniform sampler2D uSceneDepth;
+#endif
+#ifdef USE_CONTACT
+uniform vec4 uContact;       // x = ray length (m), y = thickness (m), z = strength
+#endif
 
 uniform samplerCube uIrradiance;
 uniform samplerCube uPrefilter;
@@ -183,23 +213,54 @@ struct Surface {
   vec3 energyComp;
   float clearcoat;
   float ccA;
+  vec3 sheenColor;
+  float sheenA;
+  vec3 aT;
+  vec3 aB;
+  float at;
+  float ab;
+  vec3 sssColor;
+  float sssWrap;
 };
 
 // Evaluates one punctual/directional light. Returns radiance split in diffuse / specular.
 void evalLight(Surface s, vec3 L, vec3 radiance, inout vec3 diffuse, inout vec3 specular) {
-  float NoL = saturate(dot(s.N, L));
+  float rawNoL = dot(s.N, L);
+  float NoL = saturate(rawNoL);
+#ifdef USE_SSS
+  if (rawNoL + s.sssWrap <= 0.0) return;
+#else
   if (NoL <= 0.0) return;
+#endif
   vec3 H = normalize(s.V + L);
   float NoH = saturate(dot(s.N, H));
   float LoH = saturate(dot(L, H));
   float VoH = saturate(dot(s.V, H));
   vec3 NxH = cross(s.N, H);
 
+#ifdef USE_ANISO
+  float D = D_GGX_Aniso(s.at, s.ab, dot(s.aT, H), dot(s.aB, H), NoH);
+  float Vis = V_SmithGGXCorrelated_Aniso(s.at, s.ab, dot(s.aT, s.V), dot(s.aB, s.V), dot(s.aT, L), dot(s.aB, L), s.NoV, NoL);
+#else
   float D = D_GGX(s.a, NoH, NxH);
   float Vis = V_SmithGGXCorrelated(s.NoV, NoL, s.a);
+#endif
   vec3 F = F_Schlick(s.F0, VoH);
   vec3 Fr = D * Vis * F * s.energyComp;
   vec3 Fd = s.diffuseColor * INV_PI;
+
+  // diffuse cosine term (wrapped + tinted when subsurface scattering is on)
+  vec3 dN = vec3(NoL);
+#ifdef USE_SSS
+  {
+    float wrap = saturate((rawNoL + s.sssWrap) / (1.0 + s.sssWrap));
+    dN += s.sssColor * (wrap - NoL);
+  }
+#endif
+
+#ifdef USE_SHEEN
+  specular += s.sheenColor * (D_Charlie(s.sheenA, NoH) * V_Neubelt(s.NoV, NoL)) * radiance * NoL;
+#endif
 
 #ifdef USE_CLEARCOAT
   if (s.clearcoat > 0.0) {
@@ -210,14 +271,120 @@ void evalLight(Surface s, vec3 L, vec3 radiance, inout vec3 diffuse, inout vec3 
     float Vc = V_Kelemen(LoH);
     float coat = Dc * Vc * Fc;
     float att = 1.0 - Fc;
-    diffuse += Fd * att * att * radiance * NoL;
+    diffuse += Fd * att * att * radiance * dN;
     specular += (Fr * att * att * NoL + vec3(coat * NoLc)) * radiance;
     return;
   }
 #endif
-  diffuse += Fd * radiance * NoL;
+  diffuse += Fd * radiance * dN;
   specular += Fr * radiance * NoL;
 }
+
+#ifdef USE_IRIDESCENCE
+// Thin-film interference (analytic approximation): reflectance oscillates with the optical path
+// difference 2·η·d·cosθ₂ at three representative wavelengths.
+vec3 applyIridescence(vec3 F0, float metalness, float NoV) {
+  float eta = max(uIrid.y, 1.0);
+  float sin2 = (1.0 - NoV * NoV) / (eta * eta);
+  float cos2 = sqrt(max(1.0 - sin2, 0.0));
+  float opd = 2.0 * eta * uIrid.z * cos2;
+  vec3 irid = 0.5 - 0.5 * cos(TWO_PI * opd / vec3(650.0, 510.0, 475.0));
+  vec3 dielectric = vec3(0.04) + vec3(0.36) * irid;
+  vec3 metal = F0 * (0.35 + 1.3 * irid);
+  return mix(F0, clamp(mix(dielectric, metal, metalness), 0.0, 1.0), uIrid.x);
+}
+#endif
+
+#ifdef USE_WATER
+float cNoiseFoam(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = fract(sin(dot(i, vec2(127.1, 311.7))) * 43758.5453);
+  float b = fract(sin(dot(i + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
+  float c = fract(sin(dot(i + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+  float d = fract(sin(dot(i + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+// Sum of directional waves with deep-water dispersion; returns the height-field gradient.
+vec2 waterGradient(vec2 p, float t, float amp, float scale) {
+  vec2 g = vec2(0.0);
+  float freq = 0.9 * scale;
+  float a = amp;
+  float angle = 0.4;
+  for (int i = 0; i < 7; i++) {
+    angle += 2.399963;
+    vec2 dir = vec2(cos(angle), sin(angle));
+    float speed = sqrt(9.81 * freq);
+    float ph = dot(dir, p) * freq + t * speed;
+    g += dir * (a * freq * cos(ph));
+    freq *= 1.55;
+    a *= 0.5;
+  }
+  return g;
+}
+#endif
+
+#ifdef USE_CONTACT
+// Screen-space contact shadow toward the sun: short depth-buffer ray march that grounds small objects.
+float contactShadow(vec3 wp, vec3 Ng, vec3 L) {
+  vec3 vp = (uView * vec4(wp + Ng * 0.015, 1.0)).xyz;
+  vec3 vL = mat3(uView) * L;
+  float len = uContact.x;
+  float jitter = interleavedGradientNoise(gl_FragCoord.xy);
+  float occ = 0.0;
+  for (int i = 0; i < 12; i++) {
+    float t = (float(i) + jitter) / 12.0;
+    vec3 sp = vp + vL * (t * len);
+    vec4 c = uProj * vec4(sp, 1.0);
+    if (c.w <= 0.0) break;
+    vec2 suv = c.xy / c.w * 0.5 + 0.5;
+    if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) break;
+    float sd = linZ(textureLod(uSceneDepth, suv, 0.0).r);
+    float diff = -sp.z - sd;
+    if (diff > 0.006 * -sp.z + t * 0.02 && diff < uContact.y) occ = 1.0;
+  }
+  float fade = 1.0 - smoothstep(25.0, 55.0, -vp.z);
+  return 1.0 - occ * uContact.z * fade;
+}
+#endif
+
+#ifdef USE_TRANSMISSION
+// Refraction of the opaque scene (already resolved + mip-chained) with volume absorption.
+vec3 getTransmission(vec3 N, vec3 V, vec3 baseCol, float roughness, float NoV, vec3 specAlbedo, out float behindDist) {
+  float ior = max(uTrans.w, 1.0);
+  vec3 rdir = refract(-V, N, 1.0 / ior);
+  if (dot(rdir, rdir) < 1e-6) rdir = -V;
+  rdir = normalize(rdir);
+  vec2 screenUv = gl_FragCoord.xy * uScreen.zw;
+  float travel = uTrans.y;
+#ifdef USE_WATER
+  float surfZ = linZ(gl_FragCoord.z);
+  float sd0 = texture(uSceneDepth, screenUv).r;
+  float behind0 = sd0 >= 1.0 ? 60.0 : max(linZ(sd0) - surfZ, 0.0);
+  travel = min(behind0, 2.0) * 0.85;
+#endif
+  vec3 exitPos = vWorldPos + rdir * travel;
+  vec4 clip = uViewProj * vec4(exitPos, 1.0);
+  vec2 uv = clip.w > 1e-4 ? clip.xy / clip.w * 0.5 + 0.5 : screenUv;
+  uv = clamp(uv, vec2(0.002), vec2(0.998));
+  float pathLen = travel;
+  behindDist = 0.0;
+#ifdef USE_WATER
+  float sd1 = texture(uSceneDepth, uv).r;
+  if (sd1 < gl_FragCoord.z - 1e-6) {   // refracted lookup landed on something in front of the water: don't leak it
+    uv = screenUv;
+    sd1 = sd0;
+  }
+  behindDist = sd1 >= 1.0 ? 60.0 : max(linZ(sd1) - surfZ, 0.0);
+  pathLen = behindDist / max(NoV, 0.3);
+#endif
+  float lod = roughness * log2(max(uScreen.x, uScreen.y)) * clamp(ior * 2.0 - 2.0, 0.0, 1.0);
+  vec3 scene = textureLod(uTransmissionTex, uv, lod).rgb;
+  vec3 T = exp(-uAttCoeff * pathLen);
+  return baseCol * scene * T * (1.0 - specAlbedo);
+}
+#endif
 
 void main() {
   vec2 uv = vUv * uUvTransform.xy + uUvTransform.zw;
@@ -250,23 +417,36 @@ void main() {
   if (!gl_FrontFacing) Ng = -Ng;
 #endif
   vec3 N = Ng;
-#ifdef USE_NORMALMAP
-  vec3 tn = texture(uNormalMap, uv).xyz * 2.0 - 1.0;
-  tn.xy *= uNormalScale;
+#ifdef USE_WATER
+  {
+    float wd = length(uCamPos.xyz - vWorldPos);
+    float damp = 1.0 / (1.0 + wd * 0.012);   // fade the ripples with distance (no moire / shimmer)
+    vec2 wg = waterGradient(vWorldPos.xz, uCamPos.w * uWave.z, uWave.x * damp, uWave.y);
+    N = normalize(Ng + vec3(-wg.x, 0.0, -wg.y));
+  }
+#endif
+#if defined(USE_NORMALMAP) || defined(USE_ANISO)
+  vec3 Tg;
+  vec3 Bg;
   #ifdef USE_TANGENT
-    vec3 T = normalize(vTangent.xyz);
-    T = normalize(T - Ng * dot(Ng, T));
-    vec3 B = cross(Ng, T) * vTangent.w;
-    N = normalize(mat3(T, B, Ng) * tn);
+    Tg = normalize(vTangent.xyz);
+    Tg = normalize(Tg - Ng * dot(Ng, Tg));
+    Bg = cross(Ng, Tg) * vTangent.w;
   #else
     vec3 dp1 = dFdx(vWorldPos), dp2 = dFdy(vWorldPos);
     vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
     vec3 dp2perp = cross(dp2, Ng), dp1perp = cross(Ng, dp1);
-    vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
-    vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-    float invmax = inversesqrt(max(max(dot(T, T), dot(B, B)), 1e-20));
-    N = normalize(mat3(T * invmax, B * invmax, Ng) * tn);
+    vec3 T0 = dp2perp * duv1.x + dp1perp * duv2.x;
+    vec3 B0 = dp2perp * duv1.y + dp1perp * duv2.y;
+    float invmax = inversesqrt(max(max(dot(T0, T0), dot(B0, B0)), 1e-20));
+    Tg = T0 * invmax;
+    Bg = B0 * invmax;
   #endif
+#endif
+#ifdef USE_NORMALMAP
+  vec3 tn = texture(uNormalMap, uv).xyz * 2.0 - 1.0;
+  tn.xy *= uNormalScale;
+  N = normalize(mat3(Tg, Bg, Ng) * tn);
 #endif
 
   // ── specular anti-aliasing (Tokuyoshi & Kaplanyan) – removes shimmering on bumpy / distant surfaces ──
@@ -278,7 +458,10 @@ void main() {
   float perceptual = sqrt(alpha);
 
   float NoV = max(dot(N, V), 1e-4);
-  vec3 F0 = mix(vec3(0.04), base.rgb, metalness);
+  vec3 F0 = mix(vec3(min(uSpec.x * uSpec.y, 1.0)), base.rgb, metalness);
+#ifdef USE_IRIDESCENCE
+  F0 = applyIridescence(F0, metalness, NoV);
+#endif
   vec3 diffuseColor = base.rgb * (1.0 - metalness);
 
   // split-sum environment BRDF + multiple-scattering energy compensation (Fdez-Aguera 2019)
@@ -292,6 +475,43 @@ void main() {
   s.clearcoat = uClearcoat.x;
   float ccRough = clamp(uClearcoat.y, 0.045, 1.0);
   s.ccA = ccRough * ccRough;
+  s.sheenColor = vec3(0.0);
+  s.sheenA = 1.0;
+  s.aT = vec3(1.0, 0.0, 0.0);
+  s.aB = vec3(0.0, 0.0, 1.0);
+  s.at = s.a;
+  s.ab = s.a;
+  s.sssColor = vec3(0.0);
+  s.sssWrap = 0.0;
+#ifdef USE_SHEEN
+  {
+    s.sheenColor = uSheen.rgb;
+    float sr = clamp(uSheen.a, 0.07, 1.0);
+    s.sheenA = sr * sr;
+    // the sheen layer absorbs a little of the light that would reach the base layer
+    float sheenMax = max(s.sheenColor.r, max(s.sheenColor.g, s.sheenColor.b));
+    float sheenScale = 1.0 - sheenMax * 0.3;
+    s.diffuseColor *= sheenScale;
+    s.energyComp *= sheenScale;
+  }
+#endif
+#ifdef USE_ANISO
+  {
+    vec3 Ta0 = dot(Tg, Tg) > 1e-10 ? normalize(Tg) : normalize(cross(abs(Ng.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0), Ng));
+    vec3 Ba0 = dot(Bg, Bg) > 1e-10 ? normalize(Bg) : cross(Ng, Ta0);
+    vec3 Tr = Ta0 * uAniso.y + Ba0 * uAniso.z;
+    Tr = Tr - N * dot(N, Tr);
+    Tr = dot(Tr, Tr) > 1e-10 ? normalize(Tr) : Ta0;
+    s.aT = Tr;
+    s.aB = cross(N, Tr);
+    s.at = max(alpha * (1.0 + uAniso.x), 0.002);
+    s.ab = max(alpha * (1.0 - uAniso.x), 0.002);
+  }
+#endif
+#ifdef USE_SSS
+  s.sssColor = uSSS.rgb;
+  s.sssWrap = uSSS.a * 0.85;
+#endif
 
   vec3 diffuse = vec3(0.0);
   vec3 specular = vec3(0.0);
@@ -303,6 +523,9 @@ void main() {
     float shadow = 1.0;
 #ifdef USE_SHADOWS
     if (NoLs > 0.0) shadow = getShadow(vWorldPos, Ng, NoLs);
+#endif
+#ifdef USE_CONTACT
+    if (NoLs > 0.0 && shadow > 0.0) shadow = min(shadow, contactShadow(vWorldPos, Ng, L));
 #endif
     if (shadow > 0.0) evalLight(s, L, uSunColor.rgb * shadow, diffuse, specular);
   }
@@ -339,13 +562,33 @@ void main() {
   float envI = uEnvParams.x * uEnvIntensity;
   float maxLod = uEnvParams.y;
   vec3 irradiance = texture(uIrradiance, N).rgb * envI;
-  vec3 diffuseIBL = diffuseColor * irradiance * (1.0 - specAlbedo) * aoMultiBounce(ao, diffuseColor);
+  vec3 diffuseIBL = s.diffuseColor * irradiance * (1.0 - specAlbedo) * aoMultiBounce(ao, diffuseColor);
 
   vec3 R = reflect(-V, N);
+#ifdef USE_ANISO
+  {
+    // anisotropic reflection: bend the normal toward the stretched direction (Filament)
+    vec3 aDir = uAniso.x >= 0.0 ? s.aB : s.aT;
+    vec3 aNrm = cross(aDir, V);
+    vec3 bent = normalize(cross(aNrm, aDir));
+    float bendAmt = pow(1.0 - abs(uAniso.x) * (1.0 - perceptual), 4.0);
+    R = reflect(-V, normalize(mix(bent, N, bendAmt)));
+  }
+#endif
   R = normalize(mix(R, N, alpha));   // bend toward the normal on rough surfaces
   vec3 prefiltered = textureLod(uPrefilter, R, perceptual * maxLod).rgb * envI;
   float specOcc = saturate(pow(NoV + ao, exp2(-16.0 * perceptual - 1.0)) - 1.0 + ao);
-  vec3 specIBL = prefiltered * specAlbedo * energyComp * specOcc;
+  vec3 specIBL = prefiltered * specAlbedo * s.energyComp * specOcc;
+#ifdef USE_SHEEN
+  {
+    // soft velvet rim from the diffuse environment (approximation of the sheen DFG)
+    float rim = 0.2 + 1.3 * pow(1.0 - NoV, 3.0);
+    specIBL += s.sheenColor * irradiance * rim * 0.6 * ao;
+  }
+#endif
+#ifdef USE_SSS
+  diffuseIBL += diffuseColor * irradiance * uSSS.rgb * (uSSS.a * 0.3);
+#endif
 
 #ifdef USE_CLEARCOAT
   if (s.clearcoat > 0.0) {
@@ -374,7 +617,30 @@ void main() {
   outAlpha = 1.0;
 #endif
 
+#ifdef USE_TRANSMISSION
+  float behindDist;
+  vec3 transmitted = vec3(0.0);
+  {
+    float tAmt = uTrans.x;
+    diffuse *= 1.0 - tAmt;
+    diffuseIBL *= 1.0 - tAmt;
+    transmitted = getTransmission(N, V, base.rgb, roughness, NoV, specAlbedo, behindDist) * tAmt;
+  }
+#endif
+
   vec3 color = diffuse + diffuseIBL + specular + specIBL + emissive;
+#ifdef USE_TRANSMISSION
+  color += transmitted;
+  #ifdef USE_WATER
+  {
+    // shore / contact foam where the water column gets thin
+    float fn = cNoiseFoam(vWorldPos.xz * 3.1 + uCamPos.w * 0.15) * 0.65 + cNoiseFoam(vWorldPos.xz * 9.0 - uCamPos.w * 0.2) * 0.35;
+    float foam = smoothstep(0.45, 0.0, behindDist) * smoothstep(0.25, 0.75, fn);
+    vec3 foamLight = (uSunColor.rgb * max(uSunDir.y, 0.0) * 0.8 + irradiance * 3.14159) * INV_PI * 0.9;
+    color = mix(color, foamLight, foam * 0.75);
+  }
+  #endif
+#endif
 
 #ifdef USE_FOG
   color = applyFog(color, vWorldPos, outAlpha);

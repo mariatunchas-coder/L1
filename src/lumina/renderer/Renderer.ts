@@ -16,7 +16,7 @@ import { GLState, TEX_2D, TEX_2D_ARRAY, TEX_CUBE } from './GLState';
 import { PostProcessor, PostSettings, defaultPostSettings } from './PostProcessor';
 import { Program, UBO_CAMERA, UBO_LIGHTS } from './Program';
 import { GpuTimer } from './GpuTimer';
-import { ColorTarget, GBufferTarget, createColorTarget, createGBuffer, deleteColorTarget, deleteGBuffer } from './RenderTarget';
+import { ColorTarget, DepthTarget, GBufferTarget, createColorTarget, createDepthTarget, createGBuffer, deleteColorTarget, deleteGBuffer } from './RenderTarget';
 import { Resources } from './Resources';
 import { depthFrag, depthVert, gbufFrag, gbufVert, pbrFrag, pbrVert } from './shaders/pbr';
 
@@ -79,7 +79,16 @@ const F_MAP = 1,
   F_UNLIT = 2048,
   F_SHADOWS = 4096,
   F_SSAO = 8192,
-  F_FOG = 16384;
+  F_FOG = 16384,
+  F_SHEEN = 32768,
+  F_ANISO = 65536,
+  F_IRID = 131072,
+  F_TRANSMISSION = 262144,
+  F_WATER = 524288,
+  F_SSS = 1048576,
+  F_CONTACT = 2097152;
+
+const isWater = (m: Material): boolean => m.kind === 'pbr' && (m as PBRMaterial).waves > 0;
 
 const CAM_FLOATS = 108;
 const LIGHT_FLOATS = 104 + 32 * 16;
@@ -192,6 +201,11 @@ export class Renderer {
   private temporalReset = false;
   private listeners: [string, EventListener][] = [];
   private opaque: RenderItem[] = [];
+  /** refractive materials: drawn after the opaque pass + background, sampling a mip-chained copy of it */
+  private transmissive: RenderItem[] = [];
+  private hasWater = false;
+  private trans: ColorTarget | null = null;
+  private depthCopy: DepthTarget | null = null;
   private transparent: RenderItem[] = [];
   private pool: RenderItem[] = [];
   private poolIndex = 0;
@@ -263,6 +277,7 @@ export class Renderer {
     gl.getExtension('OES_texture_float_linear');
     this.parallelExt = gl.getExtension('KHR_parallel_shader_compile');
 
+    this.resources?.invalidate(); // GPU handles of the previous context are dead – never touch them again
     this.state = new GLState(gl);
     this.resources = new Resources(gl, this.state);
 
@@ -286,6 +301,8 @@ export class Renderer {
     this.depthPrograms.clear();
     this.gbufPrograms.clear();
     this.hdr = this.depthPre = null;
+    this.trans = null;
+    this.depthCopy = null;
     this.msaaFbo = this.msaaColor = this.msaaDepth = null;
     this.rw = this.rh = 0;
     this.lastEnvUpdate = -1e9;
@@ -341,6 +358,61 @@ export class Renderer {
     return this.timer.supported;
   }
 
+  /**
+   * Pre-builds every shader variant `scene` needs with the *current* render settings, so the first frames
+   * after loading (or after toggling an effect) don't hitch. Blocks until linked; throws with an annotated
+   * log if a shader fails to compile. Prefer `compileAsync` for large scenes.
+   */
+  compile(scene: Scene): void {
+    if (this.contextLost) return;
+    for (const p of this.warmPrograms(scene)) p.finalize();
+  }
+
+  /** Non-blocking variant of `compile` (uses KHR_parallel_shader_compile where available). */
+  compileAsync(scene: Scene): Promise<void> {
+    if (this.contextLost) return Promise.resolve();
+    const progs = this.warmPrograms(scene);
+    return new Promise<void>((resolve, reject) => {
+      const poll = () => {
+        try {
+          let done = true;
+          for (const p of progs) if (!p.isReady()) done = false;
+          if (done) resolve();
+          else setTimeout(poll, 12);
+        } catch (e) {
+          reject(e);
+        }
+      };
+      poll();
+    });
+  }
+
+  private warmPrograms(scene: Scene): Program[] {
+    const P = this.post;
+    const frame = (this.shadowsEnabled ? F_SHADOWS : 0) | (P.ssao.enabled ? F_SSAO : 0) | (scene.fog ? F_FOG : 0) | (P.contactShadows.enabled ? F_CONTACT : 0);
+    const gbuf = P.taa.enabled || P.ssr.enabled || P.motionBlur.enabled;
+    const out = new Set<Program>();
+    const visit = (o: Object3D): void => {
+      if (o.isMesh) {
+        const mesh = o as Mesh;
+        const mat = mesh.material;
+        if (mat.visible) {
+          let flags = this.featureFlags(mesh, mat);
+          if (!(flags & F_UNLIT)) {
+            flags |= frame & (F_SSAO | F_FOG);
+            if (mesh.receiveShadow) flags |= frame & (F_SHADOWS | (flags & F_WATER ? 0 : F_CONTACT));
+          }
+          out.add(this.getProgram(flags));
+          if (!mat.transparent) out.add(gbuf ? this.getGBufProgram(flags) : this.getDepthProgram(flags));
+          if (mesh.castShadow && !mat.transparent) out.add(this.getDepthProgram(this.featureFlags(mesh, mat)));
+        }
+      }
+      for (const c of o.children) visit(c);
+    };
+    visit(scene);
+    return [...out];
+  }
+
   /** Renders `scene` as seen from `camera` to the canvas. */
   render(scene: Scene, camera: PerspectiveCamera): void {
     if (this.contextLost) return;
@@ -378,8 +450,7 @@ export class Renderer {
     const P = this.post;
     const taaOn = P.taa.enabled;
     const needColor = taaOn || P.ssr.enabled || P.motionBlur.enabled;
-    const needDepth = needColor || P.dof.enabled || P.ssao.enabled || P.volumetricFog.enabled;
-    this.ensureTargets(rw, rh, needDepth, needColor);
+    const needDepthBase = needColor || P.dof.enabled || P.ssao.enabled || P.volumetricFog.enabled;
 
     // ── image based lighting (re-baked lazily when the sky changes) ──
     const sky = scene.sky ?? this.defaultSky;
@@ -434,12 +505,17 @@ export class Renderer {
     this.collect(scene, camera);
 
     const sun = this.sun;
+    // water needs the opaque depth behind it, contact shadows need the scene depth: both force a depth pre-pass
+    const needContact = P.contactShadows.enabled && !!sun && sun.intensity > 0;
+    const needDepth = needDepthBase || this.hasWater || needContact;
+    this.ensureTargets(rw, rh, needDepth, needColor);
     const useShadows = this.shadowsEnabled && !!sun && sun.castShadow && this.casters.length > 0;
     const useSSAO = this.post.ssao.enabled;
     const useGBuf = needColor && !!this.depthPre && this.depthPre.hasColor;
     // volumetric fog needs its own shadow-mapped sun, and a depth buffer to raymarch against
     const useVolumetricFog = this.post.volumetricFog.enabled && useShadows;
     const useDepthPre = useSSAO || useVolumetricFog || needDepth;
+    const useContact = needContact && !!this.depthPre;
     const fog = scene.fog;
 
     if (useShadows) this.renderShadows(sun!, camera);
@@ -465,16 +541,26 @@ export class Renderer {
     st.bindTexture(2, TEX_2D, this.env.brdfLut);
     if (useShadows && this.csm.texture) st.bindTexture(3, TEX_2D_ARRAY, this.csm.texture);
     if (aoTex) st.bindTexture(4, TEX_2D, aoTex);
-    st.bindTexture(9, TEX_CUBE, this.env.skyCube);
+    st.bindTexture(9, TEX_CUBE, this.env.backgroundCube);
+    const sceneDepthTex = this.hasWater && this.depthCopy ? this.depthCopy.texture : this.depthPre ? this.depthPre.texture : null;
+    if (sceneDepthTex && (useContact || this.hasWater)) st.bindTexture(12, TEX_2D, sceneDepthTex);
 
     for (const p of this.programs.values()) p.lastMaterial = null;
     this.textureMaterial = null;
-    const frameFlags = (useShadows ? F_SHADOWS : 0) | (useSSAO ? F_SSAO : 0) | (fog ? F_FOG : 0);
+    const frameFlags = (useShadows ? F_SHADOWS : 0) | (useSSAO ? F_SSAO : 0) | (fog ? F_FOG : 0) | (useContact ? F_CONTACT : 0);
+    if (useContact) this.contact = P.contactShadows;
 
     this.opaque.sort((a, b) => a.order - b.order || a.flags - b.flags || a.matId - b.matId || a.z - b.z);
     for (let i = 0; i < this.opaque.length; i++) this.drawItem(this.opaque[i], frameFlags);
 
     if (scene.sky) this.drawBackground(sky);
+
+    // ── refractive materials (glass, liquids, water) ──
+    if (this.transmissive.length) {
+      this.captureTransmission(sceneFbo, rw, rh);
+      this.transmissive.sort((a, b) => a.order - b.order || a.z - b.z);
+      for (let i = 0; i < this.transmissive.length; i++) this.drawItem(this.transmissive[i], frameFlags);
+    }
 
     this.transparent.sort((a, b) => a.order - b.order || b.z - a.z);
     for (let i = 0; i < this.transparent.length; i++) this.drawItem(this.transparent[i], frameFlags);
@@ -508,9 +594,10 @@ export class Renderer {
     if (gb && p.dof.enabled) cur = this.post_.dof(cur, gb, p.dof, rw, rh);
     if (gb && useGBuf && p.motionBlur.enabled) cur = this.post_.motionBlur(cur, gb, p.motionBlur, rw, rh);
 
-    const bloomTex = p.bloom.enabled ? this.post_.renderBloom(cur, p.bloom, rw, rh) : null;
+    const bloomTex = p.bloom.enabled || p.lensFlare.enabled ? this.post_.renderBloom(cur, p.bloom, rw, rh) : null;
+    const flareTex = p.lensFlare.enabled && bloomTex ? this.post_.renderLensFlare(p.lensFlare, rw, rh) : null;
     if (p.autoExposure) this.post_.updateAutoExposure(hdrTex, rw, rh, dt, p);
-    this.post_.composite(cur, bloomTex, fogTex, p, nowS, this.canvasW, this.canvasH);
+    this.post_.composite(cur, bloomTex, fogTex, flareTex, p, nowS, this.canvasW, this.canvasH);
 
     // ── remember this frame for the next frame's motion vectors ──
     this.prevVP.copy(_vpU);
@@ -525,7 +612,7 @@ export class Renderer {
 
     // ── stats ──
     info.lights = this.lights.length;
-    info.programs = this.programs.size + this.depthPrograms.size;
+    info.programs = this.programs.size + this.depthPrograms.size + this.gbufPrograms.size;
     info.geometries = this.resources.geometryCount;
     info.textures = this.resources.textureCount;
     info.width = rw;
@@ -579,6 +666,10 @@ export class Renderer {
     const gl = this.gl;
     deleteColorTarget(gl, this.state, this.hdr);
     deleteGBuffer(gl, this.state, this.depthPre);
+    deleteColorTarget(gl, this.state, this.trans);
+    deleteColorTarget(gl, this.state, this.depthCopy);
+    this.trans = null;
+    this.depthCopy = null;
     if (this.msaaFbo) gl.deleteFramebuffer(this.msaaFbo);
     if (this.msaaColor) gl.deleteRenderbuffer(this.msaaColor);
     if (this.msaaDepth) gl.deleteRenderbuffer(this.msaaDepth);
@@ -630,6 +721,8 @@ export class Renderer {
     this.opaque.length = 0;
     this.transparent.length = 0;
     this.casters.length = 0;
+    this.transmissive.length = 0;
+    this.hasWater = false;
     this.frameMeshes.length = 0;
     this.lights.length = 0;
     this.sun = null;
@@ -656,7 +749,7 @@ export class Renderer {
       }
       if (mat.visible && (!(mesh as InstancedMesh).instanceMatrix || (mesh as InstancedMesh).count > 0)) {
         const s = mesh.getWorldSphere();
-        if (mesh.castShadow && !mat.transparent) {
+        if (mesh.castShadow && !mat.transparent && !isWater(mat)) {
           const i = this.casters.length;
           if ((i + 1) * 4 > this.casterSpheres.length) {
             const n = new Float64Array(this.casterSpheres.length * 2);
@@ -676,7 +769,10 @@ export class Renderer {
           it.order = mesh.renderOrder;
           it.matId = mat.id;
           it.flags = this.featureFlags(mesh, mat);
-          (mat.transparent ? this.transparent : this.opaque).push(it);
+          if (it.flags & F_TRANSMISSION) {
+            this.transmissive.push(it);
+            if (it.flags & F_WATER) this.hasWater = true;
+          } else (mat.transparent ? this.transparent : this.opaque).push(it);
           this.info.visible++;
         } else this.info.culled++;
       }
@@ -701,13 +797,19 @@ export class Renderer {
     } else {
       const p = m as PBRMaterial;
       if (p.map) f |= F_MAP;
-      if (p.normalMap) {
-        f |= F_NORMALMAP;
-        if (mesh.geometry.attributes.tangent) f |= F_TANGENT;
-      }
+      if (p.normalMap) f |= F_NORMALMAP;
+      if (p.anisotropy !== 0) f |= F_ANISO;
+      if ((p.normalMap || p.anisotropy !== 0) && mesh.geometry.attributes.tangent) f |= F_TANGENT;
       if (p.ormMap) f |= F_ORM;
       if (p.emissiveMap) f |= F_EMISSIVEMAP;
       if (p.clearcoat > 0) f |= F_CLEARCOAT;
+      if (p.sheen > 0) f |= F_SHEEN;
+      if (p.iridescence > 0) f |= F_IRID;
+      if (p.subsurface > 0) f |= F_SSS;
+      if (p.isTransmissive) {
+        f |= F_TRANSMISSION;
+        if (p.waves > 0) f |= F_WATER;
+      }
     }
     return f;
   }
@@ -733,6 +835,13 @@ export class Renderer {
       if (flags & F_SHADOWS) d.push('USE_SHADOWS');
       if (flags & F_SSAO) d.push('USE_SSAO');
       if (flags & F_FOG) d.push('USE_FOG');
+      if (flags & F_SHEEN) d.push('USE_SHEEN');
+      if (flags & F_ANISO) d.push('USE_ANISO');
+      if (flags & F_IRID) d.push('USE_IRIDESCENCE');
+      if (flags & F_TRANSMISSION) d.push('USE_TRANSMISSION');
+      if (flags & F_WATER) d.push('USE_WATER');
+      if (flags & F_SSS) d.push('USE_SSS');
+      if (flags & F_CONTACT) d.push('USE_CONTACT');
       p = new Program(this.gl, this.state, pbrVert, pbrFrag, d, 'pbr[' + d.join(',') + ']', this.parallelExt);
       this.programs.set(flags, p);
     }
@@ -816,7 +925,7 @@ export class Renderer {
     let flags = item.flags;
     if (!(flags & F_UNLIT)) {
       flags |= frameFlags & (F_SSAO | F_FOG);
-      if (mesh.receiveShadow) flags |= frameFlags & F_SHADOWS;
+      if (mesh.receiveShadow) flags |= frameFlags & (F_SHADOWS | (flags & F_WATER ? 0 : F_CONTACT));
     }
     const program = this.getProgram(flags);
     if (!this.ready(program)) return;
@@ -848,6 +957,20 @@ export class Renderer {
         gl.uniform1f(L.uEnvIntensity, m.envMapIntensity);
         gl.uniform1f(L.uAoStrength, m.aoMapIntensity);
         gl.uniform4f(L.uUvTransform, m.uvTransform[0], m.uvTransform[1], m.uvTransform[2], m.uvTransform[3]);
+        const f0 = ((m.ior - 1) / (m.ior + 1)) ** 2;
+        gl.uniform2f(L.uSpec, Number.isFinite(f0) ? f0 : 0.04, m.specularIntensity);
+        if (flags & F_SHEEN) gl.uniform4f(L.uSheen, m.sheenColor.r * m.sheen, m.sheenColor.g * m.sheen, m.sheenColor.b * m.sheen, m.sheenRoughness);
+        if (flags & F_ANISO) gl.uniform4f(L.uAniso, clamp(m.anisotropy, -1, 1), Math.cos(m.anisotropyRotation), Math.sin(m.anisotropyRotation), 0);
+        if (flags & F_IRID) gl.uniform4f(L.uIrid, clamp(m.iridescence, 0, 1), m.iridescenceIOR, m.iridescenceThickness, 0);
+        if (flags & F_SSS) gl.uniform4f(L.uSSS, m.subsurfaceColor.r, m.subsurfaceColor.g, m.subsurfaceColor.b, clamp(m.subsurface, 0, 1));
+        if (flags & F_WATER) gl.uniform4f(L.uWave, m.waves, m.waveScale, m.waveSpeed, 0);
+        if (flags & F_TRANSMISSION) {
+          // Beer–Lambert coefficient: colour after `attenuationDistance` metres → per-metre absorption
+          const d = m.attenuationDistance;
+          const k = (c: number) => (Number.isFinite(d) && d > 0 ? -Math.log(Math.max(c, 1e-4)) / d : 0);
+          gl.uniform3f(L.uAttCoeff, k(m.attenuationColor.r), k(m.attenuationColor.g), k(m.attenuationColor.b));
+        }
+        if (flags & F_CONTACT) gl.uniform4f(L.uContact, this.contact.length, this.contact.thickness, this.contact.strength, 0);
       } else {
         const m = mat as UnlitMaterial;
         gl.uniform4f(L.uBaseColor, m.color.r, m.color.g, m.color.b, m.opacity);
@@ -864,6 +987,12 @@ export class Renderer {
         mesh.normalMatrixVersion = mesh.worldVersion;
       }
       gl.uniformMatrix3fv(L.uNormalMatrix, false, mesh.normalMatrix.elements);
+    }
+
+    if (flags & F_TRANSMISSION) {
+      const tm = mat as PBRMaterial;
+      // thickness lives in the mesh's local units → scale to metres
+      gl.uniform4f(L.uTrans, clamp(tm.transmission, 0, 1), tm.thickness * mesh.matrixWorld.getMaxScaleOnAxis(), 0, tm.ior);
     }
 
     st.setSide(mat.side);
@@ -934,11 +1063,33 @@ export class Renderer {
     gl.uniform3f(p.loc.uSunDir, sky.sunDirection.x, sky.sunDirection.y, sky.sunDirection.z);
     gl.uniform3f(p.loc.uSunE, this.env.sunE.r, this.env.sunE.g, this.env.sunE.b);
     gl.uniform1f(p.loc.uSunSize, sky.sunDiskScale);
+    gl.uniform4f(p.loc.uCloud, this.env.cloudsActive ? sky.cloudCoverage : 0, sky.cloudDensity, sky.cloudScale, 0);
+    gl.uniform2f(p.loc.uCloudOffset, sky.cloudOffset.x, sky.cloudOffset.y);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     this.info.calls++;
   }
 
   // ───────────────────────────────── passes ─────────────────────────────────
+
+  private contact: PostSettings['contactShadows'] = defaultPostSettings().contactShadows;
+
+  /** Resolves the scene rendered so far into a mip-chained texture (unit 11) that refractive surfaces sample. */
+  private captureTransmission(src: WebGLFramebuffer, w: number, h: number): void {
+    const gl = this.gl;
+    const st = this.state;
+    if (!this.trans || this.trans.width !== w || this.trans.height !== h) {
+      deleteColorTarget(gl, st, this.trans);
+      this.trans = createColorTarget(gl, st, w, h, gl.RGBA16F, { mipmaps: true });
+    }
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, src);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.trans.fbo);
+    gl.blitFramebuffer(0, 0, w, h, 0, 0, w, h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    st.invalidateFramebuffer();
+    st.bindScratch(TEX_2D, this.trans.texture);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    st.bindFramebuffer(src);
+    st.bindTexture(11, TEX_2D, this.trans.texture);
+  }
 
   private renderShadows(sun: DirectionalLight, camera: PerspectiveCamera): void {
     const gl = this.gl;
@@ -994,11 +1145,10 @@ export class Renderer {
       gl.clearBufferfv(gl.COLOR, 1, ZERO4);
     }
     let bound: Program | null = null;
-    for (let i = 0; i < this.opaque.length; i++) {
-      const it = this.opaque[i];
-      if (it.material.kind === 'unlit' && it.material.transparent) continue;
+    const draw = (it: RenderItem): void => {
+      if (it.material.kind === 'unlit' && it.material.transparent) return;
       const prog = withColor ? this.getGBufProgram(it.flags) : this.getDepthProgram(it.flags);
-      if (!this.ready(prog)) continue;
+      if (!this.ready(prog)) return;
       if (prog !== bound) {
         prog.use();
         if (!withColor) gl.uniformMatrix4fv(prog.loc.uViewProj, false, viewProj.elements);
@@ -1006,6 +1156,21 @@ export class Renderer {
       }
       if (withColor) this.drawGBufMesh(it.mesh, prog, it.flags);
       else this.drawDepthMesh(it.mesh, prog, it.flags);
+    };
+    for (let i = 0; i < this.opaque.length; i++) draw(this.opaque[i]);
+    for (let i = 0; i < this.transmissive.length; i++) if (!(this.transmissive[i].flags & F_WATER)) draw(this.transmissive[i]);
+    if (this.hasWater) {
+      // water samples the opaque depth behind it → snapshot it before the water surface itself is written
+      if (!this.depthCopy || this.depthCopy.width !== dp.width || this.depthCopy.height !== dp.height) {
+        deleteColorTarget(gl, st, this.depthCopy);
+        this.depthCopy = createDepthTarget(gl, st, dp.width, dp.height);
+      }
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, dp.fbo);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.depthCopy.fbo);
+      gl.blitFramebuffer(0, 0, dp.width, dp.height, 0, 0, dp.width, dp.height, gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+      st.invalidateFramebuffer();
+      st.bindFramebuffer(dp.fbo);
+      for (let i = 0; i < this.transmissive.length; i++) if (this.transmissive[i].flags & F_WATER) draw(this.transmissive[i]);
     }
     st.setColorMask(true);
   }

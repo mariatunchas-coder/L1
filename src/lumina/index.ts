@@ -1,8 +1,10 @@
 /**
  * Lumina – a performance-first, physically based WebGL2 rendering engine.
  *
- * Features: PBR + IBL, cascaded shadows, SSAO, SSR, TAA, DoF, motion blur, volumetric fog, bloom,
- * auto exposure, glTF 2.0 loader, animation, LOD, GPU instancing, GPU timing.
+ * Features: PBR + IBL (sheen, anisotropy, iridescence, subsurface, refraction/transmission, water),
+ * cascaded + contact shadows, SSAO, SSR, TAA, DoF, motion blur, volumetric fog, procedural clouds,
+ * bloom + lens flare, AgX / ACES tone mapping, CDL grading, auto exposure, glTF 2.0 loader,
+ * animation, LOD, GPU instancing, static batching, adaptive quality, GPU timing.
  *
  *   import { Renderer, Scene, PerspectiveCamera, Mesh, SphereGeometry, PBRMaterial } from './lumina';
  */
@@ -18,7 +20,7 @@ export { Scene } from './core/Scene';
 export { PerspectiveCamera } from './core/Camera';
 export { Mesh, InstancedMesh } from './core/Mesh';
 export { Geometry, BufferAttribute } from './core/Geometry';
-export { Material, PBRMaterial, UnlitMaterial, FrontSide, BackSide, DoubleSide } from './core/Material';
+export { Material, PBRMaterial, WaterMaterial, UnlitMaterial, FrontSide, BackSide, DoubleSide } from './core/Material';
 export type { PBRMaterialParams } from './core/Material';
 export { Texture } from './core/Texture';
 export { Light, DirectionalLight, PointLight, SpotLight } from './core/Lights';
@@ -42,3 +44,7 @@ export type { RendererOptions, RenderInfo } from './renderer/Renderer';
 export { defaultPostSettings } from './renderer/PostProcessor';
 export type { PostSettings, ToneMapping } from './renderer/PostProcessor';
 export { OrbitControls } from './controls/OrbitControls';
+export { applyQuality, AdaptiveQuality, QUALITY_LEVELS } from './quality/Quality';
+export type { QualityLevel } from './quality/Quality';
+export { mergeGeometries } from './util/Merge';
+export type { MergeItem } from './util/Merge';

@@ -119,6 +119,30 @@ float F_Schlick1(float f0, float VoH) {
   float f = pow(1.0 - VoH, 5.0);
   return f + f0 * (1.0 - f);
 }
+
+// ── anisotropic GGX (Filament / Burley 2012) ──
+float D_GGX_Aniso(float at, float ab, float ToH, float BoH, float NoH) {
+  float a2 = at * ab;
+  vec3 d = vec3(ab * ToH, at * BoH, a2 * NoH);
+  float d2 = max(dot(d, d), 1e-8);
+  float b2 = a2 / d2;
+  return a2 * b2 * b2 * INV_PI;
+}
+float V_SmithGGXCorrelated_Aniso(float at, float ab, float ToV, float BoV, float ToL, float BoL, float NoV, float NoL) {
+  float lambdaV = NoL * length(vec3(at * ToV, ab * BoV, NoV));
+  float lambdaL = NoV * length(vec3(at * ToL, ab * BoL, NoL));
+  return 0.5 / max(lambdaV + lambdaL, 1e-5);
+}
+
+// ── cloth sheen: Charlie NDF (Estevez & Kulla 2017) + Neubelt visibility ──
+float D_Charlie(float alpha, float NoH) {
+  float invAlpha = 1.0 / max(alpha, 0.02);
+  float sin2h = max(1.0 - NoH * NoH, 0.0078125);
+  return (2.0 + invAlpha) * pow(sin2h, invAlpha * 0.5) / (2.0 * PI);
+}
+float V_Neubelt(float NoV, float NoL) {
+  return clamp(1.0 / (4.0 * (NoL + NoV - NoL * NoV)), 0.0, 1.0);
+}
 `,
 
   // Single-tap shadow test, no normal offset (there's no surface normal in a volume).
@@ -143,6 +167,73 @@ float fogShadowSample(vec3 wp, float viewZ) {
   float dist = uShadowInfo.w;
   float s = texture(uShadowMap, vec4(uvz.xy, float(c), uvz.z - bias));
   return mix(1.0, s, saturate((dist - viewZ) / (dist * 0.12)));
+}
+`,
+
+  // Procedural cumulus layer shared by the sky bake (image based lighting) and the background pass
+  // (analytic, so the visible clouds stay razor sharp instead of being limited by cubemap resolution).
+  clouds: /* glsl */ `
+uniform vec4 uCloud;          // x coverage, y density, z scale, w unused
+uniform vec2 uCloudOffset;    // wind drift
+
+float cHash(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float cNoise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(cHash(i), cHash(i + vec2(1.0, 0.0)), u.x), mix(cHash(i + vec2(0.0, 1.0)), cHash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+float cFbm(vec2 p) {
+  float s = 0.0;
+  float a = 0.5;
+  const mat2 R = mat2(1.6, 1.2, -1.2, 1.6);
+  for (int i = 0; i < 5; i++) {
+    s += a * cNoise(p);
+    p = R * p;
+    a *= 0.5;
+  }
+  return s * 1.0323;
+}
+float cloudField(vec2 p) {
+  vec2 q = p * uCloud.z + uCloudOffset;
+  float warp = cNoise(q * 0.5 + 3.1);
+  float base = cFbm(q * 0.42 + warp * 0.6);
+  float det = cFbm(q * 1.9 + 11.7 - warp);
+  return base * 0.78 + det * 0.22;
+}
+float cloudDensity(vec2 p) {
+  float t = mix(0.74, 0.28, clamp(uCloud.x, 0.0, 1.0));
+  return smoothstep(t, t + 0.24, cloudField(p));
+}
+float hgPhase(float mu, float g) {
+  float g2 = g * g;
+  return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-3), 1.5));
+}
+
+// Returns premultiplied radiance (rgb) and coverage (a). 'ambient' is the sky radiance overhead.
+vec4 cloudLayer(vec3 dir, vec3 sunDir, vec3 sunE, vec3 ambient) {
+  if (uCloud.x <= 0.001 || dir.y <= 0.0) return vec4(0.0);
+  float h = max(dir.y, 0.02);
+  vec2 p = dir.xz / (h + 0.18);
+  float d = cloudDensity(p);
+  if (d <= 0.001) return vec4(0.0);
+  float horizonFade = smoothstep(0.0, 0.2, dir.y);
+  // two taps toward the sun approximate self shadowing (dark bellies, bright rims)
+  vec2 toSun = sunDir.xz / max(sunDir.y + 0.25, 0.25) * 0.05;
+  float tau = cloudDensity(p + toSun) + 0.7 * cloudDensity(p + toSun * 2.5);
+  float light = exp(-tau * 1.8 * uCloud.y);
+  float mu = dot(dir, sunDir);
+  float phase = 0.45 + 2.6 * mix(hgPhase(mu, 0.62), hgPhase(mu, -0.25), 0.3);
+  float sunUp = smoothstep(-0.08, 0.12, sunDir.y);
+  vec3 lit = sunE * INV_PI * 0.9 * light * phase * sunUp;
+  float thick = clamp(d * uCloud.y, 0.0, 1.0);
+  vec3 amb = ambient * (1.05 - 0.45 * thick);
+  float alpha = (1.0 - exp(-d * uCloud.y * 3.2)) * horizonFade;
+  return vec4((lit + amb) * alpha, alpha);
 }
 `,
 

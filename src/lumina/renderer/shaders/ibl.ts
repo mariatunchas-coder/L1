@@ -110,6 +110,29 @@ void main() {
 }
 `;
 
+/**
+ * Composites the procedural cloud layer over the clear-sky cubemap (for image based lighting only –
+ * the visible background evaluates the same clouds analytically at full resolution).
+ */
+export const skyCloudFrag = /* glsl */ `
+#include <common>
+#include <ibl_sampling>
+#include <clouds>
+uniform samplerCube uCube;
+uniform int uFace;
+uniform vec3 uSunDir;
+uniform vec3 uSunE;
+in vec2 vUv;
+out vec4 fragColor;
+void main() {
+  vec3 dir = normalize(cubeFaceDir(uFace, vUv * 2.0 - 1.0));
+  vec3 sky = textureLod(uCube, dir, 0.0).rgb;
+  vec3 ambient = textureLod(uCube, vec3(0.0, 1.0, 0.0), 5.0).rgb;
+  vec4 c = cloudLayer(dir, uSunDir, uSunE, ambient);
+  fragColor = vec4(sky * (1.0 - c.a) + c.rgb, 1.0);
+}
+`;
+
 export const irradianceFrag = /* glsl */ `
 #include <common>
 #include <ibl_sampling>
@@ -231,6 +254,7 @@ void main() {
 export const backgroundFrag = /* glsl */ `
 #include <common>
 #include <ubo_camera>
+#include <clouds>
 uniform samplerCube uSkyCube;
 uniform vec3 uSunDir;
 uniform vec3 uSunE;
@@ -240,6 +264,12 @@ layout(location = 0) out vec4 fragColor;
 void main() {
   vec3 dir = normalize(vDir);
   vec3 col = textureLod(uSkyCube, dir, 0.0).rgb;
+  vec4 cloud = vec4(0.0);
+  if (uCloud.x > 0.001) {
+    vec3 ambient = textureLod(uSkyCube, vec3(0.0, 1.0, 0.0), 5.0).rgb;
+    cloud = cloudLayer(dir, uSunDir, uSunE, ambient);
+    col = col * (1.0 - cloud.a) + cloud.rgb;
+  }
   // analytic sun disk (cube is too coarse for it) – radiance clamped to the fp16 range
   float r = 0.00465 * uSunSize;
   // |dir x sun| = sin(angle): stays accurate for tiny angles where cos() collapses in fp32
@@ -247,7 +277,7 @@ void main() {
   float disk = (1.0 - smoothstep(r * 0.9, r * 1.2, ang)) * step(0.0, dot(dir, uSunDir));
   float solid = PI * r * r;
   vec3 sunRadiance = min(uSunE / solid, vec3(20000.0));
-  col += sunRadiance * disk * step(0.0, dir.y + 0.01);
+  col += sunRadiance * disk * step(0.0, dir.y + 0.01) * (1.0 - cloud.a);
   fragColor = vec4(col, 1.0);
 }
 `;

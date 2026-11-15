@@ -2,7 +2,7 @@ import type { Sky } from '../core/Sky';
 import { Color } from '../math/Color';
 import { GLState, TEX_2D, TEX_CUBE } from './GLState';
 import { Program } from './Program';
-import { backgroundFrag, backgroundVert, brdfFrag, fullscreenVert, irradianceFrag, prefilterFrag, skyFrag } from './shaders/ibl';
+import { backgroundFrag, backgroundVert, brdfFrag, fullscreenVert, irradianceFrag, prefilterFrag, skyCloudFrag, skyFrag } from './shaders/ibl';
 
 /**
  * Image based lighting resources, all generated on the GPU:
@@ -12,7 +12,10 @@ import { backgroundFrag, backgroundVert, brdfFrag, fullscreenVert, irradianceFra
  *   brdfLut     – split-sum scale/bias table             → specular BRDF integration
  */
 export class EnvironmentMaps {
+  /** Atmosphere + clouds (lighting source: irradiance / prefilter are derived from it). */
   readonly skyCube: WebGLTexture;
+  /** Clear-sky copy, only allocated while clouds are enabled (the background draws clouds analytically on top of it). */
+  private clearCube: WebGLTexture | null = null;
   readonly irradiance: WebGLTexture;
   readonly prefilter: WebGLTexture;
   readonly brdfLut: WebGLTexture;
@@ -26,7 +29,15 @@ export class EnvironmentMaps {
   private irrProg: Program;
   private prefProg: Program;
   private brdfProg: Program;
+  private cloudProg: Program;
   private checked = false;
+  /** True while the baked environment contains clouds (the background then draws them analytically on top). */
+  cloudsActive = false;
+
+  /** Cubemap the visible background samples (clear sky while clouds are on, otherwise the full sky). */
+  get backgroundCube(): WebGLTexture {
+    return this.cloudsActive && this.clearCube ? this.clearCube : this.skyCube;
+  }
 
   constructor(private gl: WebGL2RenderingContext, private state: GLState, readonly skySize = 256) {
     const mipLevels = (s: number) => Math.floor(Math.log2(s)) + 1;
@@ -39,6 +50,7 @@ export class EnvironmentMaps {
     this.irrProg = new Program(gl, state, fullscreenVert, irradianceFrag, [], 'irradiance').finalize();
     this.prefProg = new Program(gl, state, fullscreenVert, prefilterFrag, [], 'prefilter').finalize();
     this.brdfProg = new Program(gl, state, fullscreenVert, brdfFrag, [], 'brdf').finalize();
+    this.cloudProg = new Program(gl, state, fullscreenVert, skyCloudFrag, [], 'skyClouds').finalize();
 
     this.brdfLut = gl.createTexture()!;
     state.bindScratch(TEX_2D, this.brdfLut);
@@ -103,7 +115,11 @@ export class EnvironmentMaps {
     const sun = sky.getSunLight();
     this.sunE.copy(sun.color).multiplyScalar(sun.intensity);
 
-    // 1. atmosphere → cube
+    // 1. atmosphere → cube (clear cube first when clouds are composited on top)
+    const clouds = sky.cloudCoverage > 0.001;
+    if (clouds && !this.clearCube) this.clearCube = this.createCube(this.skySize, Math.floor(Math.log2(this.skySize)) + 1);
+    this.cloudsActive = clouds;
+    const atmosphereTarget = clouds ? this.clearCube! : this.skyCube;
     this.skyProg.use();
     gl.uniform3f(this.skyProg.loc.uSunDir, sky.sunDirection.x, sky.sunDirection.y, sky.sunDirection.z);
     gl.uniform3f(this.skyProg.loc.uSunE, this.sunE.r, this.sunE.g, this.sunE.b);
@@ -113,9 +129,21 @@ export class EnvironmentMaps {
     gl.uniform1f(this.skyProg.loc.uSunI, sky.sunIntensity);
     gl.uniform1f(this.skyProg.loc.uBoost, sky.scatteringBoost);
     gl.uniform3f(this.skyProg.loc.uGroundAlbedo, sky.groundAlbedo.r, sky.groundAlbedo.g, sky.groundAlbedo.b);
-    this.renderFaces(this.skyProg, this.skyCube, 0, this.skySize);
-    this.state.bindScratch(TEX_CUBE, this.skyCube);
+    this.renderFaces(this.skyProg, atmosphereTarget, 0, this.skySize);
+    this.state.bindScratch(TEX_CUBE, atmosphereTarget);
     gl.generateMipmap(gl.TEXTURE_CUBE_MAP);
+
+    if (clouds) {
+      this.cloudProg.use();
+      this.state.bindTexture(0, TEX_CUBE, this.clearCube);
+      gl.uniform3f(this.cloudProg.loc.uSunDir, sky.sunDirection.x, sky.sunDirection.y, sky.sunDirection.z);
+      gl.uniform3f(this.cloudProg.loc.uSunE, this.sunE.r, this.sunE.g, this.sunE.b);
+      gl.uniform4f(this.cloudProg.loc.uCloud, sky.cloudCoverage, sky.cloudDensity, sky.cloudScale, 0);
+      gl.uniform2f(this.cloudProg.loc.uCloudOffset, sky.cloudOffset.x, sky.cloudOffset.y);
+      this.renderFaces(this.cloudProg, this.skyCube, 0, this.skySize);
+      this.state.bindScratch(TEX_CUBE, this.skyCube);
+      gl.generateMipmap(gl.TEXTURE_CUBE_MAP);
+    }
 
     // 2. diffuse irradiance
     this.irrProg.use();
@@ -135,12 +163,13 @@ export class EnvironmentMaps {
 
   dispose(): void {
     const gl = this.gl;
-    for (const t of [this.skyCube, this.irradiance, this.prefilter, this.brdfLut]) {
+    for (const t of [this.skyCube, this.clearCube, this.irradiance, this.prefilter, this.brdfLut]) {
+      if (!t) continue;
       this.state.forgetTexture(t);
       gl.deleteTexture(t);
     }
     gl.deleteFramebuffer(this.fbo);
-    for (const p of [this.skyProg, this.irrProg, this.prefProg, this.brdfProg]) p.dispose();
+    for (const p of [this.skyProg, this.irrProg, this.prefProg, this.brdfProg, this.cloudProg]) p.dispose();
   }
 }
 

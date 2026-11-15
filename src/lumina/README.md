@@ -1,6 +1,44 @@
-# Lumina
+# Lumina 2
 
-Performance-first, physically based **WebGL2** rendering engine (TypeScript, zero runtime dependencies).
+Performance-first, physically based **WebGL2** rendering engine (TypeScript, zero runtime dependencies) – now with
+photographic material layers, real refraction, water, procedural clouds and a cinematic post stack.
+
+## What's new in Lumina 2
+
+| Area | Feature |
+| --- | --- |
+| Materials | **Sheen** (Charlie, velvet) · **anisotropy** (stretched GGX + bent IBL, brushed metal) · **iridescence** (thin-film, analytic approximation) · **subsurface** wrap lighting (wax / skin) · **IOR → F0** + `specularIntensity` |
+| Refraction | **Transmission pass**: the opaque scene is resolved into a mip-chained texture, refracted by IOR, blurred by roughness, absorbed with Beer–Lambert (`thickness`, `attenuationColor/Distance`). Glass, liquids, frosted panels, bubbles |
+| Water | `WaterMaterial`: dispersive wave normals, refraction, **depth-aware absorption from the real opaque depth**, shore foam, no leaking of objects in front of the water |
+| Sky | Procedural **clouds** (`sky.cloudCoverage/Density/Scale/cloudOffset`): baked into the IBL, drawn analytically (razor sharp) in the background, filter the sun when overcast |
+| Shadows | **Contact shadows** (`post.contactShadows`) – depth ray march toward the sun |
+| Post | **AgX** tone mapper · ASC **CDL** grade · **lens flare** (thresholded ghosts + halo) · lens distortion |
+| glTF | Real `KHR_materials_transmission / volume / ior / sheen / specular / iridescence / anisotropy` (factors) |
+| Performance | `renderer.compile()` / `compileAsync()` shader pre-warm · `applyQuality()` presets · `AdaptiveQuality` governor (reversible ladder of savings) · `mergeGeometries()` static batching |
+| Robustness | Fixed: texture counter drift after resize, dispose listeners touching dead handles after a context restore, `info.programs` ignoring G-buffer variants |
+
+```ts
+import { PBRMaterial, WaterMaterial, applyQuality, AdaptiveQuality } from './lumina';
+
+const glass = new PBRMaterial({ roughness: 0.02, transmission: 1, ior: 1.5, thickness: 1.2, attenuationColor: 0x99ddcc, attenuationDistance: 6 });
+const velvet = new PBRMaterial({ color: 0x440008, roughness: 0.9, sheen: 1, sheenColor: 0xff6a80, sheenRoughness: 0.3 });
+const steel = new PBRMaterial({ color: 0xe6e6ea, metalness: 1, roughness: 0.34, anisotropy: 0.9 }); // geometry.computeTangents() for stable direction
+const water = new WaterMaterial({ waves: 0.04 });                                                  // on a horizontal plane
+
+scene.sky.cloudCoverage = 0.45; scene.sky.touch(); sun.syncWithSky(scene.sky);
+renderer.post.toneMapping = 'agx';
+renderer.post.contactShadows.enabled = true;
+renderer.post.lensFlare.enabled = true;
+
+applyQuality(renderer, 'high', sun);
+await renderer.compileAsync(scene);               // no hitches on first frames
+const governor = new AdaptiveQuality(renderer);   // governor.enabled = true; call governor.update(dt) each frame
+```
+
+Notes: iridescence and sheen IBL are analytic approximations; water assumes a horizontal surface; refractive surfaces
+do not see each other (single-layer refraction); transmissive meshes are not reflected by SSR except water.
+
+## Lumina 1 feature overview
 
 ## Feature overview
 

@@ -48,6 +48,13 @@ export class Resources {
   textureCount = 0;
   private maxAniso = 1;
   defaultAnisotropy = 8;
+  /** Set when the GL context was lost/replaced: every handle owned by this instance is dead and must not be touched. */
+  private stale = false;
+
+  /** Called by the renderer before it builds a replacement after a context restore. */
+  invalidate(): void {
+    this.stale = true;
+  }
 
   constructor(private gl: WebGL2RenderingContext, private state: GLState) {
     const ext = gl.getExtension('EXT_texture_filter_anisotropic');
@@ -88,9 +95,11 @@ export class Resources {
     if (!rec) {
       rec = { buffer: gl.createBuffer()!, version: -1, byteLength: 0 };
       this.buffers.set(a, rec);
+      const owned = rec;
       a.disposeListeners.add(() => {
-        gl.deleteBuffer(rec!.buffer);
-        this.buffers.delete(a);
+        if (this.stale) return;
+        gl.deleteBuffer(owned.buffer);
+        if (this.buffers.get(a) === owned) this.buffers.delete(a);
       });
     }
     if (rec.version !== a.version) {
@@ -134,6 +143,7 @@ export class Resources {
         }
       }
       g.disposeListeners.add(() => {
+        if (this.stale) return;
         gl.deleteVertexArray(vao);
         this.vaos.delete(g);
         this.geometryCount--;
@@ -177,6 +187,7 @@ export class Resources {
       // immutable storage → recreate
       this.state.forgetTexture(rec.texture);
       gl.deleteTexture(rec.texture);
+      this.textureCount--;
       rec = undefined;
     }
     if (!rec) {
@@ -188,6 +199,8 @@ export class Resources {
       gl.texStorage2D(gl.TEXTURE_2D, levels, t.colorSpace === 'srgb' ? gl.SRGB8_ALPHA8 : gl.RGBA8, t.width, t.height);
       const owner = rec;
       t.disposeListeners.add(() => {
+        // a resized texture gets a new record (and a new listener) – the old listener must not delete the new one
+        if (this.stale || this.textures.get(t) !== owner) return;
         this.state.forgetTexture(owner.texture);
         gl.deleteTexture(owner.texture);
         this.textures.delete(t);

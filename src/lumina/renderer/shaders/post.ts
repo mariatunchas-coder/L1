@@ -210,6 +210,11 @@ uniform sampler2D uTex0;   // HDR scene
 uniform sampler2D uTex1;   // bloom
 uniform sampler2D uTex2;   // adapted luminance
 uniform sampler2D uTex3;   // volumetric fog: rgb in-scatter, a transmittance
+uniform sampler2D uTex4;   // lens flare
+uniform vec4 uParams5;     // x flare intensity, y lens distortion, z grade enabled
+uniform vec3 uSlope;       // ASC CDL (applied in display space)
+uniform vec3 uOffset;
+uniform vec3 uPower;
 uniform vec4 uParams0;     // x exposure, y bloom intensity, z vignette, w grain
 uniform vec4 uParams1;     // x saturation, y contrast, z chromatic aberration, w tone mapper
 uniform vec4 uParams2;     // x auto exposure, y key, z min lum, w max lum
@@ -255,6 +260,27 @@ vec3 hableCurve(vec3 x) {
 vec3 filmic(vec3 c) {
   return clamp(hableCurve(c * 2.0) / hableCurve(vec3(11.2)), 0.0, 1.0);
 }
+// AgX (Troy Sobotka / Blender / Filament) – hue-preserving highlight roll-off, very photographic
+vec3 agxContrast(vec3 x) {
+  vec3 x2 = x * x;
+  vec3 x4 = x2 * x2;
+  return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+}
+vec3 agx(vec3 color) {
+  const mat3 toRec2020 = mat3(vec3(0.6274, 0.0691, 0.0164), vec3(0.3293, 0.9195, 0.0880), vec3(0.0433, 0.0113, 0.8956));
+  const mat3 fromRec2020 = mat3(vec3(1.6605, -0.1246, -0.0182), vec3(-0.5876, 1.1329, -0.1006), vec3(-0.0728, -0.0083, 1.1187));
+  const mat3 inset = mat3(vec3(0.856627153315983, 0.137318972929847, 0.11189821299995), vec3(0.0951212405381588, 0.761241990602591, 0.0767994186031903), vec3(0.0482516061458583, 0.101439036467562, 0.811302368396859));
+  const mat3 outset = mat3(vec3(1.1271005818144368, -0.1413297634984383, -0.14132976349843826), vec3(-0.11060664309660323, 1.157823702216272, -0.11060664309660294), vec3(-0.016493938717834573, -0.016493938717834257, 1.2519364065950405));
+  const float minEv = -12.47393;
+  const float maxEv = 4.026069;
+  color = inset * (toRec2020 * color);
+  color = max(color, vec3(1e-10));
+  color = clamp((log2(color) - minEv) / (maxEv - minEv), 0.0, 1.0);
+  color = agxContrast(color);
+  color = outset * color;
+  color = pow(max(color, vec3(0.0)), vec3(2.2));
+  return clamp(fromRec2020 * color, 0.0, 1.0);
+}
 vec3 toSRGB(vec3 c) {
   c = clamp(c, 0.0, 1.0);
   return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
@@ -263,6 +289,12 @@ vec3 toSRGB(vec3 c) {
 void main() {
   vec2 uv = vUv;
   vec2 dir = uv - 0.5;
+  // barrel / pincushion lens distortion
+  if (uParams5.y != 0.0) {
+    float kd = uParams5.y;
+    // for barrel distortion the corners would sample outside the image → zoom just enough to keep the edge clean
+    uv = 0.5 + dir * (1.0 + kd * dot(dir, dir) * 4.0) / (kd > 0.0 ? 1.0 + 2.0 * kd : 1.0);
+  }
   vec3 col;
   float ca = uParams1.z;
   if (ca > 0.0) {
@@ -290,6 +322,7 @@ void main() {
   }
 
   col += texture(uTex1, uv).rgb * uParams0.y;
+  if (uParams5.x > 0.0) col += texture(uTex4, uv).rgb * uParams5.x;
   col *= vec3(1.0 + 0.22 * uParams4.y, 1.0 + 0.02 * uParams4.y, 1.0 - 0.22 * uParams4.y);
 
   float exposure = uParams0.x;
@@ -307,17 +340,60 @@ void main() {
   else if (tm == 2) col = acesFilm(col);
   else if (tm == 3) col = neutral(col);
   else if (tm == 4) col = filmic(col);
+  else if (tm == 5) col = agx(col);
   else col = clamp(col, 0.0, 1.0);
 
   float l = luma(col);
   col = mix(vec3(l), col, uParams1.x);
   col = toSRGB(col);
   col = (col - 0.5) * uParams1.y + 0.5;
+  if (uParams5.z > 0.5) col = pow(max(col * uSlope + uOffset, vec3(0.0)), uPower);
 
   // film grain + triangular dither (kills banding in smooth sky gradients)
   float n1 = interleavedGradientNoise(gl_FragCoord.xy + uParams3.x * 61.0);
   float n2 = interleavedGradientNoise(gl_FragCoord.xy + 17.0 + uParams3.x * 43.0);
   col += (n1 + n2 - 1.0) * (1.0 / 255.0 + uParams0.w * 0.06);
   fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+`;
+
+/**
+ * Screen-space lens flare (Chapman): ghosts mirrored through the image centre, a ring halo and
+ * per-channel chromatic offset. Reads the thresholded, blurred bloom pyramid, so only genuinely
+ * bright light sources (sun, lamps, neon) produce flares.
+ */
+export const lensFlareFrag = /* glsl */ `
+uniform sampler2D uTex0;
+uniform vec4 uFlare;   // x ghost count, y dispersal, z halo width, w chromatic offset
+uniform float uFlareThreshold;  // scene-linear brightness a pixel needs before it can flare
+in vec2 vUv;
+out vec4 fragColor;
+// only genuinely intense sources (sun, lamps, neon) pass – ordinary bright surfaces and sky never flare
+vec3 src(vec2 uv) {
+  vec3 c = texture(uTex0, uv).rgb;
+  float l = max(c.r, max(c.g, c.b));
+  return c * smoothstep(uFlareThreshold, uFlareThreshold * 2.0, l);
+}
+vec3 chroma(vec2 uv, vec2 dir, float d) {
+  return vec3(src(uv + dir * d).r, src(uv).g, src(uv - dir * d).b);
+}
+void main() {
+  vec2 uv = vec2(1.0) - vUv;
+  vec2 ghostVec = (vec2(0.5) - uv) * uFlare.y;
+  float gLen = length(ghostVec);
+  vec2 ndir = gLen > 1e-5 ? ghostVec / gLen : vec2(0.0);
+  vec3 res = vec3(0.0);
+  for (int i = 0; i < 8; i++) {
+    if (float(i) >= uFlare.x) break;
+    vec2 off = fract(uv + ghostVec * float(i));
+    float w = pow(max(1.0 - length(vec2(0.5) - off) / 0.70710678, 0.0), 3.0);
+    // coated-lens tint cycles through the spectrum
+    vec3 tint = 0.6 + 0.4 * cos(6.2831853 * (float(i) * 0.19 + vec3(0.0, 0.33, 0.67)));
+    res += chroma(off, ndir, uFlare.w) * w * tint;
+  }
+  vec2 haloUv = fract(uv + ndir * uFlare.z);
+  float wh = pow(max(1.0 - length(vec2(0.5) - haloUv) / 0.70710678, 0.0), 5.0);
+  res += chroma(haloUv, ndir, uFlare.w) * wh;
+  fragColor = vec4(min(res, vec3(24.0)), 1.0);
 }
 `;

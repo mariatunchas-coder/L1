@@ -1,4 +1,5 @@
 import {
+  AdaptiveQuality,
   AnimationMixer,
   BoxGeometry,
   Clock,
@@ -29,6 +30,7 @@ import {
   TorusKnotGeometry,
   UnlitMaterial,
   Vector3,
+  WaterMaterial,
   createBricks,
   createBrushedMetal,
   createConcrete,
@@ -75,6 +77,15 @@ export interface Showcase {
   fog: Fog;
   stressMesh: InstancedMesh;
   maxInstances: number;
+  /** Pool water (editable from the UI). */
+  water: WaterMaterial;
+  /** Frame-time governor – releases/re-applies its savings around UI changes. */
+  adaptive: AdaptiveQuality;
+  /** Wind drift of the procedural clouds. */
+  cloudDrift: boolean;
+  setClouds(coverage: number, density: number, scale: number): void;
+  /** Renders exactly one frame synchronously (used for stills and automated tests). */
+  renderOnce(): void;
   model: ModelInfo | null;
   setSun(elevation: number, azimuth: number): void;
   loadModel(src: ModelSource, onProgress?: (frac: number) => void): Promise<ModelInfo>;
@@ -215,7 +226,7 @@ export async function createShowcase(
   knot.position.set(-7.2, FLOOR_Y + 0.9 + 1.55, -3.2);
   scene.add(knot);
 
-  // ── glass sphere on pedestal (premultiplied transparency + Fresnel reflections) ──
+  // ── glass sphere on pedestal (real refraction through the transmission pass) ──
   const ped2 = new Mesh(new CylinderGeometry(1.9, 2.05, 0.9, 64), woodMat);
   ped2.name = 'Alas kayu';
   ped2.position.set(7.2, FLOOR_Y + 0.45, -3.2);
@@ -226,7 +237,7 @@ export async function createShowcase(
   scene.add(inner);
   const glass = new Mesh(
     new SphereGeometry(1.25, 128, 64),
-    new PBRMaterial({ color: lin(0.82, 0.93, 0.95), metalness: 0, roughness: 0.02, opacity: 0.16, transparent: true, name: 'Kaca' })
+    new PBRMaterial({ color: lin(0.96, 0.99, 1.0), metalness: 0, roughness: 0.02, transmission: 1, ior: 1.5, thickness: 1.1, attenuationColor: lin(0.86, 0.97, 0.93), attenuationDistance: 7, name: 'Kaca' })
   );
   glass.name = 'Bola kaca';
   glass.castShadow = false;
@@ -331,6 +342,67 @@ export async function createShowcase(
   stress.update();
   scene.add(stress);
 
+  // ── photoreal material row: sheen · anisotropy · iridescence · thin-film bubble · subsurface ──
+  const rowZ = 11.6;
+  const rowGeo = new SphereGeometry(0.9, 96, 48);
+  rowGeo.computeTangents();
+  const rowSphere = (x: number, name: string, mat: PBRMaterial) => {
+    const m = new Mesh(rowGeo, mat);
+    m.name = name;
+    m.position.set(x, FLOOR_Y + 0.9, rowZ);
+    scene.add(m);
+  };
+  rowSphere(-6, 'Beludru (sheen)', new PBRMaterial({ color: lin(0.26, 0.008, 0.03), roughness: 0.9, sheen: 1, sheenColor: lin(1.0, 0.42, 0.5), sheenRoughness: 0.32, name: 'Beludru' }));
+  rowSphere(-3, 'Baja sikat (anisotropy)', new PBRMaterial({ color: lin(0.9, 0.9, 0.92), metalness: 1, roughness: 0.34, anisotropy: 0.92, name: 'Baja sikat' }));
+  rowSphere(0, 'Titanium iridescent', new PBRMaterial({ color: lin(0.5, 0.5, 0.52), metalness: 1, roughness: 0.16, iridescence: 1, iridescenceThickness: 520, name: 'Titanium iridescent' }));
+  rowSphere(3, 'Gelembung sabun', new PBRMaterial({ color: lin(1, 1, 1), roughness: 0.02, ior: 1.0, transmission: 1, iridescence: 1, iridescenceIOR: 1.33, iridescenceThickness: 380, name: 'Gelembung sabun' }));
+  rowSphere(6, 'Lilin (subsurface)', new PBRMaterial({ color: lin(0.95, 0.72, 0.55), roughness: 0.42, subsurface: 0.9, subsurfaceColor: lin(1.0, 0.25, 0.12), name: 'Lilin' }));
+
+  // frosted glass: roughness-blurred refraction of everything behind it
+  const frosted = new Mesh(
+    new RoundedBoxGeometry(2.6, 3.4, 0.14, 0.05, 3),
+    new PBRMaterial({ color: lin(0.92, 0.97, 1.0), roughness: 0.4, ior: 1.5, transmission: 1, thickness: 0.14, name: 'Kaca buram' })
+  );
+  frosted.name = 'Kaca buram';
+  frosted.position.set(7.9, FLOOR_Y + 1.7, 8.2);
+  frosted.rotation.y = -0.4;
+  frosted.castShadow = false;
+  scene.add(frosted);
+
+  // ── reflecting pool: refractive animated water, absorption by depth, shore foam ──
+  const BX = -11,
+    BZ = 4.6,
+    BW = 8,
+    BD = 5.4,
+    RIM = 0.4,
+    RH = 1.1;
+  const stone = new PBRMaterial({ ...concrete, uvRepeat: [3, 1], roughness: 1, name: 'Batu kolam' });
+  const rim = (w: number, d: number, x: number, z: number) => {
+    const m = new Mesh(new RoundedBoxGeometry(w, RH, d, 0.05, 2), stone);
+    m.name = 'Tepi kolam';
+    m.position.set(x, FLOOR_Y + RH / 2, z);
+    scene.add(m);
+  };
+  rim(BW + 2 * RIM, RIM, BX, BZ - BD / 2 - RIM / 2);
+  rim(BW + 2 * RIM, RIM, BX, BZ + BD / 2 + RIM / 2);
+  rim(RIM, BD, BX - BW / 2 - RIM / 2, BZ);
+  rim(RIM, BD, BX + BW / 2 + RIM / 2, BZ);
+  const poolFloor = new Mesh(new BoxGeometry(BW, 0.2, BD), new PBRMaterial({ ...marble, uvRepeat: [2, 1.4], color: lin(0.62, 0.7, 0.68), roughness: 1, name: 'Dasar kolam' }));
+  poolFloor.name = 'Dasar kolam';
+  poolFloor.position.set(BX, FLOOR_Y + 0.1, BZ);
+  scene.add(poolFloor);
+  const bathed = new Mesh(new SphereGeometry(0.55, 64, 32), new PBRMaterial({ color: gold, metalness: 1, roughness: 0.22, name: 'Bola emas kolam' }));
+  bathed.name = 'Bola emas (setengah terendam)';
+  bathed.position.set(BX + 1.2, FLOOR_Y + 0.82, BZ - 0.3);
+  scene.add(bathed);
+  const water = new WaterMaterial();
+  const waterMesh = new Mesh(new PlaneGeometry(BW, BD), water);
+  waterMesh.name = 'Air kolam';
+  waterMesh.rotation.x = -Math.PI / 2;
+  waterMesh.position.set(BX, FLOOR_Y + 0.95, BZ);
+  waterMesh.castShadow = false;
+  scene.add(waterMesh);
+
   // everything except ground / platform / sun can be hidden to give imported models a clean stage
   const props = scene.children.filter((o) => o !== ground && o !== platform && o !== sun);
 
@@ -348,6 +420,8 @@ export async function createShowcase(
 
   const raycaster = new Raycaster();
   const clock = new Clock();
+  const adaptive = new AdaptiveQuality(renderer);
+  let driftAcc = 0;
   let raf = 0;
   let running = false;
 
@@ -479,6 +553,20 @@ export async function createShowcase(
     fog,
     stressMesh: stress,
     maxInstances: MAX,
+    water,
+    adaptive,
+    cloudDrift: false,
+    setClouds(coverage, density, scale) {
+      sky.cloudCoverage = coverage;
+      sky.cloudDensity = density;
+      sky.cloudScale = scale;
+      sky.touch();
+      sun.syncWithSky(sky);
+    },
+    renderOnce() {
+      controls.update(0);
+      renderer.render(scene, camera);
+    },
     animate: true,
     setSun(elevation, azimuth) {
       sky.setSun(elevation, azimuth);
@@ -513,6 +601,16 @@ export async function createShowcase(
           blueLight.position.set(10.5 * Math.cos(t * 0.25), FLOOR_Y + 2.4, 2.5 + 7 * Math.sin(t * 0.25));
           bulb.position.copy(blueLight.position);
         }
+        if (api.cloudDrift && sky.cloudCoverage > 0.001) {
+          sky.cloudOffset.x += dt * 0.035;
+          sky.cloudOffset.y += dt * 0.012;
+          driftAcc += dt;
+          if (driftAcc > 3) {
+            driftAcc = 0;
+            sky.touch(); // refresh the baked lighting so reflections follow the drifting clouds
+          }
+        }
+        adaptive.update(dt);
         controls.update(dt);
         renderer.render(scene, camera);
       };

@@ -3,12 +3,12 @@ import { GLState, TEX_2D, TEX_2D_ARRAY } from './GLState';
 import { Program } from './Program';
 import { ColorTarget, GBufferTarget, createColorTarget, deleteColorTarget } from './RenderTarget';
 import { fullscreenVert } from './shaders/ibl';
-import { adaptFrag, bloomDownFrag, bloomUpFrag, compositeFrag, lumFrag, ssaoBlurFrag, ssaoFrag } from './shaders/post';
+import { adaptFrag, bloomDownFrag, bloomUpFrag, compositeFrag, lensFlareFrag, lumFrag, ssaoBlurFrag, ssaoFrag } from './shaders/post';
 import { volumetricBlurFrag, volumetricFrag } from './shaders/volumetric';
 import { dofFrag, motionBlurFrag, ssrApplyFrag, ssrTraceFrag, taaFrag } from './shaders/effects';
 import { TEX_CUBE } from './GLState';
 
-export type ToneMapping = 'none' | 'reinhard' | 'aces' | 'neutral' | 'filmic';
+export type ToneMapping = 'none' | 'reinhard' | 'aces' | 'neutral' | 'filmic' | 'agx';
 
 export interface PostSettings {
   exposure: number;
@@ -31,6 +31,14 @@ export interface PostSettings {
   sharpen: number;
   /** White balance: -1 cool … +1 warm. */
   temperature: number;
+  /** Barrel (+) / pincushion (−) lens distortion, typical ±0.15. */
+  lensDistortion: number;
+  /** ASC CDL colour grade applied in display space (slope · offset · power per channel). */
+  cdl: { enabled: boolean; slope: [number, number, number]; offset: [number, number, number]; power: [number, number, number] };
+  /** Screen-space lens flare (ghosts + halo) driven by the bloom threshold. */
+  lensFlare: { enabled: boolean; intensity: number; threshold: number; ghosts: number; dispersal: number; halo: number; chromatic: number };
+  /** Short sun-direction depth ray march that grounds small objects (complements cascaded shadows). */
+  contactShadows: { enabled: boolean; length: number; thickness: number; strength: number };
   /** Temporal anti-aliasing (sub-pixel jitter + motion-vector reprojection + variance clipping). */
   taa: {
     enabled: boolean;
@@ -97,6 +105,10 @@ export function defaultPostSettings(): PostSettings {
     chromaticAberration: 0,
     sharpen: 0,
     temperature: 0,
+    lensDistortion: 0,
+    cdl: { enabled: false, slope: [1, 1, 1], offset: [0, 0, 0], power: [1, 1, 1] },
+    lensFlare: { enabled: false, intensity: 0.2, threshold: 8, ghosts: 5, dispersal: 0.32, halo: 0.42, chromatic: 0.012 },
+    contactShadows: { enabled: false, length: 0.7, thickness: 0.5, strength: 0.85 },
     taa: { enabled: false, feedback: 0.9, jitter: 1 },
     ssr: { enabled: false, intensity: 1, maxDistance: 40, thickness: 0.6, maxRoughness: 0.6, steps: 64 },
     dof: { enabled: false, focusDistance: 12, focalLength: 50, fStop: 2.8, maxBlur: 12, taps: 28 },
@@ -114,7 +126,7 @@ export function defaultPostSettings(): PostSettings {
   };
 }
 
-const TONE_ID: Record<ToneMapping, number> = { none: 0, reinhard: 1, aces: 2, neutral: 3, filmic: 4 };
+const TONE_ID: Record<ToneMapping, number> = { none: 0, reinhard: 1, aces: 2, neutral: 3, filmic: 4, agx: 5 };
 
 /** Screen-space effects: SSAO, bloom, auto-exposure, tone mapping & grading. */
 export class PostProcessor {
@@ -133,6 +145,8 @@ export class PostProcessor {
   private ssrApplyProg: Program;
   private dofProg: Program;
   private motionBlurProg: Program;
+  private flareProg: Program;
+  private flareRT: ColorTarget | null = null;
 
   // lazily created full-frame targets for the G-buffer driven effects
   private fx: ColorTarget[] = [];
@@ -172,6 +186,7 @@ export class PostProcessor {
     this.ssrApplyProg = mk(ssrApplyFrag, 'ssrApply');
     this.dofProg = mk(dofFrag, 'dof');
     this.motionBlurProg = mk(motionBlurFrag, 'motionBlur');
+    this.flareProg = mk(lensFlareFrag, 'lensFlare');
     this.lum = createColorTarget(gl, state, this.lumSize, this.lumSize, gl.RGBA16F, { mipmaps: true });
     this.adapt = [createColorTarget(gl, state, 1, 1, gl.R16F), createColorTarget(gl, state, 1, 1, gl.R16F)];
   }
@@ -181,8 +196,9 @@ export class PostProcessor {
     const gl = this.gl;
     this.width = w;
     this.height = h;
-    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, ...this.fx, ...this.taaHist, ...this.down, ...this.up])
+    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, ...this.fx, ...this.taaHist, ...this.down, ...this.up])
       deleteColorTarget(gl, this.state, t);
+    this.flareRT = null;
     this.fx = [];
     this.taaHist = [];
     this.ssrA = this.ssrB = null;
@@ -207,6 +223,7 @@ export class PostProcessor {
       const d = this.down[i];
       this.up.push(createColorTarget(gl, this.state, d.width, d.height, gl.R11F_G11F_B10F));
     }
+    if (this.down.length > 1) this.flareRT = createColorTarget(gl, this.state, this.down[1].width, this.down[1].height, gl.R11F_G11F_B10F);
   }
 
   private pass(target: { fbo: WebGLFramebuffer; width: number; height: number } | null, w: number, h: number): void {
@@ -338,6 +355,19 @@ export class PostProcessor {
       low = dst;
     }
     return low.texture;
+  }
+
+  /** Lens flare from the (already built) bloom pyramid. Must run after renderBloom(). */
+  renderLensFlare(s: PostSettings['lensFlare'], w: number, h: number): WebGLTexture | null {
+    const gl = this.gl;
+    if (!this.flareRT || this.down.length < 2) return null;
+    this.begin();
+    this.flareProg.use();
+    this.state.bindTexture(0, TEX_2D, this.down[1].texture);
+    gl.uniform4f(this.flareProg.loc.uFlare, Math.max(1, Math.min(8, Math.round(s.ghosts))), s.dispersal, s.halo, s.chromatic);
+    gl.uniform1f(this.flareProg.loc.uFlareThreshold, Math.max(0.1, s.threshold));
+    this.pass(this.flareRT, w, h);
+    return this.flareRT.texture;
   }
 
   /** Measures scene luminance on the GPU and adapts exposure smoothly – no CPU read-back. */
@@ -486,6 +516,7 @@ export class PostProcessor {
     sceneTex: WebGLTexture,
     bloomTex: WebGLTexture | null,
     fogTex: WebGLTexture | null,
+    flareTex: WebGLTexture | null,
     s: PostSettings,
     time: number,
     w: number,
@@ -499,18 +530,23 @@ export class PostProcessor {
     this.state.bindTexture(1, TEX_2D, bloomTex ?? sceneTex);
     this.state.bindTexture(2, TEX_2D, this.adapt[this.adaptIndex].texture);
     this.state.bindTexture(3, TEX_2D, fogTex ?? sceneTex);
+    this.state.bindTexture(4, TEX_2D, flareTex ?? sceneTex);
     gl.uniform4f(L.uParams0, s.exposure, bloomTex && s.bloom.enabled ? s.bloom.intensity : 0, s.vignette, s.grain);
     gl.uniform4f(L.uParams1, s.saturation, s.contrast, s.chromaticAberration, TONE_ID[s.toneMapping]);
     gl.uniform4f(L.uParams2, s.autoExposure ? 1 : 0, s.autoExposureKey, s.autoExposureMin, s.autoExposureMax);
     gl.uniform2f(L.uParams3, time % 100, w / h);
     gl.uniform2f(L.uParams4, Math.max(0, s.sharpen), Math.max(-1, Math.min(1, s.temperature)));
     gl.uniform1f(L.uFogEnabled, fogTex && s.volumetricFog.enabled ? 1 : 0);
+    gl.uniform4f(L.uParams5, flareTex && s.lensFlare.enabled ? Math.max(0, s.lensFlare.intensity) : 0, s.lensDistortion, s.cdl.enabled ? 1 : 0, 0);
+    gl.uniform3f(L.uSlope, s.cdl.slope[0], s.cdl.slope[1], s.cdl.slope[2]);
+    gl.uniform3f(L.uOffset, s.cdl.offset[0], s.cdl.offset[1], s.cdl.offset[2]);
+    gl.uniform3f(L.uPower, Math.max(0.05, s.cdl.power[0]), Math.max(0.05, s.cdl.power[1]), Math.max(0.05, s.cdl.power[2]));
     this.pass(null, w, h);
   }
 
   dispose(): void {
     const gl = this.gl;
-    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.lum, ...this.fx, ...this.taaHist, ...this.adapt, ...this.down, ...this.up])
+    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, this.lum, ...this.fx, ...this.taaHist, ...this.adapt, ...this.down, ...this.up])
       deleteColorTarget(gl, this.state, t);
     for (const p of [
       this.ssaoProg,
@@ -528,6 +564,7 @@ export class PostProcessor {
       this.ssrApplyProg,
       this.dofProg,
       this.motionBlurProg,
+      this.flareProg,
     ])
       p.dispose();
   }

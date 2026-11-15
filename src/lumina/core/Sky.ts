@@ -34,6 +34,14 @@ export class Sky {
   groundAlbedo = new Color(0.3, 0.28, 0.25);
   /** Angular size multiplier of the visible sun disk. */
   sunDiskScale = 1;
+  /** Procedural cumulus layer: 0 = clear sky … 1 = overcast. */
+  cloudCoverage = 0;
+  /** Optical density multiplier (thicker = darker, more opaque). */
+  cloudDensity = 1;
+  /** Feature frequency multiplier (higher = smaller clouds). */
+  cloudScale = 2.2;
+  /** Wind drift in cloud-space units. Changing it never triggers an environment re-bake (only the visible clouds move). */
+  readonly cloudOffset = { x: 0, y: 0 };
   /** Incremented whenever a parameter changes – the renderer rebakes the environment lazily. */
   version = 1;
 
@@ -73,7 +81,9 @@ export class Sky {
     );
     // the sun disappears behind the horizon (earth shadow)
     const fade = smoothstep(-2.5, 0.8, this.elevation);
-    return { color: c, intensity: this.sunIntensity * fade };
+    // heavy cloud cover filters the direct sun (the sky dome keeps lighting the scene softly)
+    const overcast = smoothstep(0.55, 1.0, this.cloudCoverage) * Math.min(1, this.cloudDensity);
+    return { color: c, intensity: this.sunIntensity * fade * (1 - 0.8 * overcast) };
   }
 }
 

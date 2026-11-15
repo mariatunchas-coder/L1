@@ -65,6 +65,11 @@ const SUPPORTED_EXT = new Set([
   'KHR_materials_clearcoat',
   'KHR_materials_transmission',
   'KHR_materials_ior',
+  'KHR_materials_volume',
+  'KHR_materials_sheen',
+  'KHR_materials_specular',
+  'KHR_materials_iridescence',
+  'KHR_materials_anisotropy',
   'KHR_texture_transform',
   'KHR_lights_punctual',
   'KHR_mesh_quantization',
@@ -88,7 +93,8 @@ const CHUNK_BIN = 0x004e4942;
  * Supported: .gltf (embedded or external buffers/images) and .glb · sparse, interleaved and
  * normalized accessors · triangle lists/strips/fans · PBR metallic-roughness materials (base colour,
  * metal/rough, occlusion, normal, emissive; MASK/BLEND/double-sided) · KHR_materials_unlit /
- * clearcoat / emissive_strength / transmission (approximated) / ior · KHR_texture_transform
+ * clearcoat / emissive_strength / transmission + volume (real refraction) / ior / sheen / specular /
+ * iridescence / anisotropy (factors only, no textures) · KHR_texture_transform
  * (offset + scale) · KHR_lights_punctual · cameras · node hierarchy · TRS animations
  * (LINEAR, STEP, CUBICSPLINE).
  *
@@ -499,9 +505,36 @@ class GLTFParser {
       }
       const tr = ext.KHR_materials_transmission;
       if (tr && (tr.transmissionFactor ?? 0) > 0) {
-        // no refraction pass: approximate transmissive glass by premultiplied transparency + Fresnel reflections
-        m.transparent = true;
-        m.opacity *= Math.max(0.04, 1 - tr.transmissionFactor * 0.9);
+        m.transmission = Math.min(1, tr.transmissionFactor);
+        if (tr.transmissionTexture) this.warn('transTex', 'Transmission textures are ignored (the uniform transmission factor is used).');
+      }
+      const vol = ext.KHR_materials_volume;
+      if (vol) {
+        m.thickness = vol.thicknessFactor ?? 0;
+        const ac: number[] = vol.attenuationColor ?? [1, 1, 1];
+        m.attenuationColor.setRGB(ac[0], ac[1], ac[2]);
+        m.attenuationDistance = vol.attenuationDistance ?? Infinity;
+        if (vol.thicknessTexture) this.warn('thickTex', 'Thickness textures are ignored (the uniform thickness factor is used).');
+      }
+      if (ext.KHR_materials_ior && typeof ext.KHR_materials_ior.ior === 'number') m.ior = Math.max(1, ext.KHR_materials_ior.ior);
+      const sh = ext.KHR_materials_sheen;
+      if (sh) {
+        const sc: number[] = sh.sheenColorFactor ?? [0, 0, 0];
+        m.sheenColor.setRGB(sc[0], sc[1], sc[2]);
+        m.sheen = Math.max(sc[0], sc[1], sc[2]) > 0 ? 1 : 0;
+        m.sheenRoughness = sh.sheenRoughnessFactor ?? 0;
+      }
+      if (ext.KHR_materials_specular) m.specularIntensity = ext.KHR_materials_specular.specularFactor ?? 1;
+      const ir = ext.KHR_materials_iridescence;
+      if (ir) {
+        m.iridescence = ir.iridescenceFactor ?? 0;
+        m.iridescenceIOR = ir.iridescenceIor ?? 1.3;
+        m.iridescenceThickness = ir.iridescenceThicknessMaximum ?? 400;
+      }
+      const an = ext.KHR_materials_anisotropy;
+      if (an) {
+        m.anisotropy = Math.max(-1, Math.min(1, an.anisotropyStrength ?? 0));
+        m.anisotropyRotation = an.anisotropyRotation ?? 0;
       }
       if (tt) {
         const s: number[] = tt.scale ?? [1, 1];
@@ -620,7 +653,7 @@ class GLTFParser {
     const makeMesh = (p: Prim, name: string) => {
       const m = new Mesh(p.geometry, p.material);
       m.name = name;
-      m.castShadow = !p.material.transparent;
+      m.castShadow = !p.material.transparent && !((p.material as PBRMaterial).transmission > 0);
       meshes.push(m);
       return m;
     };

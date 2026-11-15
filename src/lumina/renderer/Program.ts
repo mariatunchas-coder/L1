@@ -13,6 +13,9 @@ export const SAMPLER_UNITS: Record<string, number> = {
   uOrmMap: 7,
   uEmissiveMap: 8,
   uSkyCube: 9,
+  /** refracted-scene colour (mip-chained) and opaque scene depth – main pass only */
+  uTransmissionTex: 11,
+  uSceneDepth: 12,
   // generic post-processing inputs
   uTex0: 0,
   uTex1: 1,
