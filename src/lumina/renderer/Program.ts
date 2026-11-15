@@ -16,6 +16,8 @@ export const SAMPLER_UNITS: Record<string, number> = {
   /** refracted-scene colour (mip-chained) and opaque scene depth – main pass only */
   uTransmissionTex: 11,
   uSceneDepth: 12,
+  /** parallax occlusion height field – main pass only */
+  uHeightMap: 13,
   // generic post-processing inputs
   uTex0: 0,
   uTex1: 1,

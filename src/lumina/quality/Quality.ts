@@ -11,9 +11,9 @@ export const QUALITY_LEVELS: QualityLevel[] = ['low', 'medium', 'high', 'ultra',
  *
  *  low     – no MSAA/TAA, SSAO off, 1K shadows, 75 % render scale
  *  medium  – MSAA 2×, SSAO, 2K shadows
- *  high    – TAA + SSAO + SSR + contact shadows
- *  ultra   – TAA + SSAO + SSR + contact shadows + volumetric fog + motion blur, 4K shadows
- *  photo   – ultra + lens flare, 4 cascades, 8 K-class sampling counts (for stills, not for 60 fps)
+ *  high    – TAA + SSAO + SSR + contact shadows + screen-space refraction + parallax (full quality)
+ *  ultra   – high + SSGI + volumetric fog + motion blur, 4K shadows
+ *  photo   – ultra + lens flare, 4 cascades, 2-ray SSGI, long ray marches (for stills, not for 60 fps)
  */
 export function applyQuality(renderer: Renderer, level: QualityLevel, sun?: DirectionalLight | null): void {
   const p = renderer.post;
@@ -22,6 +22,11 @@ export function applyQuality(renderer: Renderer, level: QualityLevel, sun?: Dire
     taa: boolean;
     ssao: boolean;
     ssr: boolean;
+    ssgi: boolean;
+    ssgiRays: number;
+    ssgiSteps: number;
+    refrSteps: number;
+    pom: number;
     contact: boolean;
     fog: boolean;
     mb: boolean;
@@ -39,6 +44,11 @@ export function applyQuality(renderer: Renderer, level: QualityLevel, sun?: Dire
     p.ssao.enabled = o.ssao;
     p.ssr.enabled = o.ssr;
     p.ssr.steps = o.ssrSteps;
+    p.ssgi.enabled = o.ssgi;
+    p.ssgi.rays = o.ssgiRays;
+    p.ssgi.steps = o.ssgiSteps;
+    p.refraction.steps = o.refrSteps;
+    renderer.parallax.quality = o.pom;
     p.contactShadows.enabled = o.contact;
     p.volumetricFog.enabled = o.fog;
     p.volumetricFog.steps = o.fogSteps;
@@ -55,15 +65,15 @@ export function applyQuality(renderer: Renderer, level: QualityLevel, sun?: Dire
   };
   switch (level) {
     case 'low':
-      return set({ msaa: 0, taa: false, ssao: false, ssr: false, contact: false, fog: false, mb: false, flare: false, shadow: 1024, cascades: 2, scale: 0.75, sharpen: 0, ssrSteps: 32, fogSteps: 12, dofTaps: 16 });
+      return set({ msaa: 0, taa: false, ssao: false, ssr: false, ssgi: false, ssgiRays: 1, ssgiSteps: 10, refrSteps: 12, pom: 0.5, contact: false, fog: false, mb: false, flare: false, shadow: 1024, cascades: 2, scale: 0.75, sharpen: 0, ssrSteps: 32, fogSteps: 12, dofTaps: 16 });
     case 'medium':
-      return set({ msaa: 2, taa: false, ssao: true, ssr: false, contact: false, fog: false, mb: false, flare: false, shadow: 2048, cascades: 3, scale: 1, sharpen: 0, ssrSteps: 48, fogSteps: 16, dofTaps: 24 });
+      return set({ msaa: 2, taa: false, ssao: true, ssr: false, ssgi: false, ssgiRays: 1, ssgiSteps: 12, refrSteps: 16, pom: 0.7, contact: false, fog: false, mb: false, flare: false, shadow: 2048, cascades: 3, scale: 1, sharpen: 0, ssrSteps: 48, fogSteps: 16, dofTaps: 24 });
     case 'high':
-      return set({ msaa: 0, taa: true, ssao: true, ssr: true, contact: true, fog: false, mb: false, flare: false, shadow: 2048, cascades: 3, scale: 1, sharpen: 0.25, ssrSteps: 64, fogSteps: 24, dofTaps: 28 });
+      return set({ msaa: 0, taa: true, ssao: true, ssr: true, ssgi: false, ssgiRays: 1, ssgiSteps: 14, refrSteps: 24, pom: 1, contact: true, fog: false, mb: false, flare: false, shadow: 2048, cascades: 3, scale: 1, sharpen: 0.25, ssrSteps: 64, fogSteps: 24, dofTaps: 28 });
     case 'ultra':
-      return set({ msaa: 0, taa: true, ssao: true, ssr: true, contact: true, fog: true, mb: true, flare: false, shadow: 4096, cascades: 4, scale: 1, sharpen: 0.25, ssrSteps: 96, fogSteps: 32, dofTaps: 40 });
+      return set({ msaa: 0, taa: true, ssao: true, ssr: true, ssgi: true, ssgiRays: 1, ssgiSteps: 16, refrSteps: 28, pom: 1, contact: true, fog: true, mb: true, flare: false, shadow: 4096, cascades: 4, scale: 1, sharpen: 0.25, ssrSteps: 96, fogSteps: 32, dofTaps: 40 });
     case 'photo':
-      return set({ msaa: 0, taa: true, ssao: true, ssr: true, contact: true, fog: true, mb: false, flare: true, shadow: 4096, cascades: 4, scale: 1, sharpen: 0.3, ssrSteps: 128, fogSteps: 48, dofTaps: 56 });
+      return set({ msaa: 0, taa: true, ssao: true, ssr: true, ssgi: true, ssgiRays: 2, ssgiSteps: 24, refrSteps: 40, pom: 1, contact: true, fog: true, mb: false, flare: true, shadow: 4096, cascades: 4, scale: 1, sharpen: 0.3, ssrSteps: 128, fogSteps: 48, dofTaps: 56 });
   }
 }
 
@@ -100,6 +110,9 @@ export class AdaptiveQuality {
       return () => (r.renderScale = old);
     };
     this.steps = [
+      { name: 'SSGI rays', degrade: (r) => { const o = r.post.ssgi.rays; const st = r.post.ssgi.steps; r.post.ssgi.rays = 1; r.post.ssgi.steps = Math.min(st, 10); return () => { r.post.ssgi.rays = o; r.post.ssgi.steps = st; }; } },
+      { name: 'parallax quality', degrade: (r) => { const o = r.parallax.quality; r.parallax.quality = Math.min(o, 0.55); return () => (r.parallax.quality = o); } },
+      { name: 'refraction steps', degrade: (r) => { const o = r.post.refraction.steps; r.post.refraction.steps = Math.min(o, 12); return () => (r.post.refraction.steps = o); } },
       { name: 'lens flare', degrade: (r) => { const o = r.post.lensFlare.enabled; r.post.lensFlare.enabled = false; return () => (r.post.lensFlare.enabled = o); } },
       { name: 'volumetric steps', degrade: (r) => { const o = r.post.volumetricFog.steps; r.post.volumetricFog.steps = Math.min(o, 12); return () => (r.post.volumetricFog.steps = o); } },
       { name: 'contact shadows', degrade: (r) => { const o = r.post.contactShadows.enabled; r.post.contactShadows.enabled = false; return () => (r.post.contactShadows.enabled = o); } },
@@ -110,6 +123,7 @@ export class AdaptiveQuality {
       { name: 'volumetric fog', degrade: (r) => { const o = r.post.volumetricFog.enabled; r.post.volumetricFog.enabled = false; return () => (r.post.volumetricFog.enabled = o); } },
       { name: 'SSR', degrade: (r) => { const o = r.post.ssr.enabled; r.post.ssr.enabled = false; return () => (r.post.ssr.enabled = o); } },
       { name: 'render scale 70%', degrade: (r) => clampScale(r, Math.min(r.renderScale, 0.7)) },
+      { name: 'SSGI', degrade: (r) => { const o = r.post.ssgi.enabled; r.post.ssgi.enabled = false; return () => (r.post.ssgi.enabled = o); } },
       { name: 'SSAO', degrade: (r) => { const o = r.post.ssao.enabled; r.post.ssao.enabled = false; return () => (r.post.ssao.enabled = o); } },
       { name: 'render scale 55%', degrade: (r) => clampScale(r, Math.min(r.renderScale, 0.55)) },
     ];

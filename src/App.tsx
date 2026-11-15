@@ -86,6 +86,26 @@ interface Settings {
   // performa adaptif
   adaptive: boolean;
   adaptiveFps: number;
+  // Lumina 3: SSGI
+  ssgi: boolean;
+  ssgiIntensity: number;
+  ssgiRadius: number;
+  ssgiRays: number;
+  ssgiSteps: number;
+  ssgiBlur: number;
+  ssgiDebug: boolean;
+  // refraksi & dispersi
+  refrSS: boolean;
+  refrBend: number;
+  refrSteps: number;
+  dispersion: number;
+  // parallax occlusion mapping
+  pom: boolean;
+  pomQuality: number;
+  pomDepth: number;
+  pomShadow: number;
+  pomAO: number;
+  pomSteps: number;
 }
 
 const DEFAULTS: Settings = {
@@ -160,9 +180,26 @@ const DEFAULTS: Settings = {
   waterColor: '#3aa7a8',
   adaptive: false,
   adaptiveFps: 58,
+  ssgi: true,
+  ssgiIntensity: 1.8,
+  ssgiRadius: 6,
+  ssgiRays: 1,
+  ssgiSteps: 16,
+  ssgiBlur: 3,
+  ssgiDebug: false,
+  refrSS: true,
+  refrBend: 0.4,
+  refrSteps: 24,
+  dispersion: 1,
+  pom: true,
+  pomQuality: 1,
+  pomDepth: 1,
+  pomShadow: 1,
+  pomAO: 0.5,
+  pomSteps: 40,
 };
 
-const STORAGE_KEY = 'lumina.settings.v3';
+const STORAGE_KEY = 'lumina.settings.v4';
 
 /** Merges untrusted JSON into the defaults, keeping only keys of the right type. */
 function sanitize(raw: unknown): Settings {
@@ -184,11 +221,11 @@ function loadSettings(): Settings {
 }
 
 const QUALITY: { name: string; patch: Partial<Settings> }[] = [
-  { name: 'Rendah', patch: { msaa: 0, taa: false, ssao: false, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 1024, cascades: 2, scale: 0.75, volFog: false, bloom: true, sharpen: 0 } },
-  { name: 'Sedang', patch: { msaa: 2, taa: false, ssao: true, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0 } },
-  { name: 'Tinggi', patch: { msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0.25 } },
-  { name: 'Ultra', patch: { msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: true, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.25 } },
-  { name: 'Foto', patch: { msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: true, dof: true, mb: false, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.3, tone: 'agx' } },
+  { name: 'Rendah', patch: { ssgi: false, pomQuality: 0.5, refrSteps: 12, msaa: 0, taa: false, ssao: false, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 1024, cascades: 2, scale: 0.75, volFog: false, bloom: true, sharpen: 0 } },
+  { name: 'Sedang', patch: { ssgi: false, pomQuality: 0.7, refrSteps: 16, msaa: 2, taa: false, ssao: true, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0 } },
+  { name: 'Tinggi', patch: { ssgi: true, ssgiRays: 1, ssgiSteps: 14, pomQuality: 1, refrSteps: 24, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0.25 } },
+  { name: 'Ultra', patch: { ssgi: true, ssgiRays: 1, ssgiSteps: 16, pomQuality: 1, refrSteps: 28, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: true, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.25 } },
+  { name: 'Foto', patch: { ssgi: true, ssgiRays: 2, ssgiSteps: 24, pomQuality: 1, refrSteps: 40, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: true, dof: true, mb: false, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.3, tone: 'agx' } },
 ];
 
 type V3 = [number, number, number];
@@ -226,6 +263,8 @@ const SNIPPET = `import { Renderer, Scene, PerspectiveCamera,
   DirectionalLight, OrbitControls } from './lumina';
 
 const renderer = new Renderer({ canvas, samples: 0 });
+renderer.post.ssgi.enabled = true;         // GI: warna memantul antar-objek
+renderer.post.refraction.bend = 0.4;       // refraksi screen-space (lensa)
 renderer.post.taa.enabled = true;          // anti-aliasing temporal
 renderer.post.ssr.enabled = true;          // pantulan screen-space
 renderer.post.dof.enabled = true;          // depth of field
@@ -235,6 +274,10 @@ scene.sky = new Sky();
 const sun = new DirectionalLight();
 sun.syncWithSky(scene.sky);
 scene.add(sun);
+
+// POM: set tekstur prosedural sudah membawa heightMap
+const brick = new PBRMaterial({ ...createBricks(), parallaxScale: 0.04 });
+const glass = new PBRMaterial({ transmission: 1, ior: 1.52, thickness: 0.7, dispersion: 4 });
 
 const gltf = await new GLTFLoader().load('model.glb');
 scene.add(gltf.scene);
@@ -248,6 +291,9 @@ mixer.clipAction(gltf.animations[0]).play();
 })();`;
 
 const FEATURES: [string, string][] = [
+  ['Screen-Space Global Illumination — SSGI (baru)', 'Pantulan warna tidak langsung antar-objek ala Lumen: ray cosine-weighted di half-res, ray-march depth, akumulasi temporal (reproyeksi velocity + penolakan disocclusion), blur bilateral depth/normal, upsample bilateral × albedo G-buffer'],
+  ['Parallax Occlusion Mapping — POM (baru)', 'Kedalaman 3D nyata pada bata, kayu, beton & marmer: ray-march height field + refinement biner, self-shadow matahari, cavity AO, normal dari height map, mip stabil (textureGrad), fade jarak & kualitas adaptif'],
+  ['Screen-Space Refraction + dispersi (baru)', 'Ray refraksi di-march menembus depth opaque (parallax benar), bend lensa, dispersi kromatik per kanal RGB (KHR_materials_dispersion), anti-alias mip otomatis, tolak kebocoran objek di depan kaca, fallback ke environment di tepi layar'],
   ['Refraksi & transmisi nyata (baru)', 'Pass transmission: scene di belakang objek di-resolve ke mip-chain, dibelokkan sesuai IOR, diburamkan oleh roughness, diserap Beer–Lambert (kaca, cairan, kaca buram)'],
   ['Air fotorealistik (baru)', 'Gelombang dispersi air dalam, refraksi, serapan warna berdasarkan kedalaman nyata dari depth buffer, busa tepi, tanpa kebocoran objek di depan air'],
   ['Material berlapis (baru)', 'Sheen Charlie (beludru), anisotropy GGX (baja sikat), iridescence film tipis, subsurface wrap (lilin/kulit), IOR → F0'],
@@ -420,6 +466,20 @@ export default function App() {
     p.volumetricFog.heightFalloff = s.volFogHeightFalloff;
     p.volumetricFog.anisotropy = s.volFogAnisotropy;
     p.volumetricFog.intensity = s.volFogIntensity;
+    p.ssgi.enabled = s.ssgi;
+    p.ssgi.intensity = s.ssgiIntensity;
+    p.ssgi.radius = s.ssgiRadius;
+    p.ssgi.rays = s.ssgiRays;
+    p.ssgi.steps = s.ssgiSteps;
+    p.ssgi.blur = s.ssgiBlur;
+    p.ssgi.debug = s.ssgiDebug;
+    p.refraction.screenSpace = s.refrSS;
+    p.refraction.bend = s.refrBend;
+    p.refraction.steps = s.refrSteps;
+    sh.setDispersion(s.dispersion);
+    r.parallax.enabled = s.pom;
+    r.parallax.quality = s.pomQuality;
+    sh.setParallax(s.pomDepth, s.pomShadow, s.pomAO, s.pomSteps);
     p.contactShadows.enabled = s.contact;
     p.contactShadows.length = s.contactLength;
     p.contactShadows.strength = s.contactStrength;
@@ -540,7 +600,7 @@ export default function App() {
           </div>
           <div>
             <div className="text-sm font-semibold tracking-wide text-white drop-shadow">LUMINA</div>
-            <div className="text-[10px] uppercase tracking-[0.2em] text-slate-300/80 drop-shadow">WebGL2 · PBR · Refraksi · Air · Awan · AgX</div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-slate-300/80 drop-shadow">WebGL2 · SSGI · POM · Refraksi + Dispersi · AgX</div>
           </div>
         </div>
       </div>
@@ -694,10 +754,10 @@ export default function App() {
                 <Slider label="Intensitas bloom" value={s.bloomIntensity} min={0} max={0.6} step={0.005} onChange={(v) => set('bloomIntensity', v)} />
                 <div>
                   <div className="mb-1 text-xs text-slate-400">Posisi kamera</div>
-                  <div className="grid grid-cols-5 gap-1">
-                    {(['default', 'top', 'front', 'low', 'close'] as const).map((p) => (
+                  <div className="grid grid-cols-4 gap-1">
+                    {(['default', 'top', 'front', 'low', 'close', 'relief', 'glass', 'gi'] as const).map((p) => (
                       <Button key={p} onClick={() => showRef.current?.setCameraPreset(p)}>
-                        {{ default: 'Awal', top: 'Atas', front: 'Depan', low: 'Rendah', close: 'Dekat' }[p]}
+                        {{ default: 'Awal', top: 'Atas', front: 'Depan', low: 'Rendah', close: 'Dekat', relief: 'Relief', glass: 'Kaca', gi: 'GI' }[p]}
                       </Button>
                     ))}
                   </div>
@@ -728,6 +788,47 @@ export default function App() {
 
           {tab === 'effects' && (
             <>
+              <Section title="Global illumination (SSGI)">
+                <Toggle label="Aktifkan SSGI" hint="warna memantul antar-objek" value={s.ssgi} onChange={(v) => set('ssgi', v)} />
+                {s.ssgi && (
+                  <>
+                    <Slider label="Intensitas bounce" value={s.ssgiIntensity} min={0} max={4} step={0.05} onChange={(v) => set('ssgiIntensity', v)} />
+                    <Slider label="Radius bounce" value={s.ssgiRadius} min={1} max={20} step={0.5} onChange={(v) => set('ssgiRadius', v)} fmt={(v) => v.toFixed(1) + ' m'} />
+                    <Segmented label="Ray per piksel" value={s.ssgiRays} options={[1, 2, 3, 4].map((n) => ({ label: String(n), value: n }))} onChange={(v) => set('ssgiRays', v)} />
+                    <Segmented label="Langkah ray" value={s.ssgiSteps} options={[{ label: '8', value: 8 }, { label: '16', value: 16 }, { label: '24', value: 24 }, { label: '32', value: 32 }]} onChange={(v) => set('ssgiSteps', v)} />
+                    <Slider label="Denoise spasial" value={s.ssgiBlur} min={0} max={8} step={1} onChange={(v) => set('ssgiBlur', v)} fmt={(v) => v.toFixed(0) + ' px'} />
+                    <Toggle label="Tampilkan bounce saja" hint="debug" value={s.ssgiDebug} onChange={(v) => set('ssgiDebug', v)} />
+                  </>
+                )}
+                <Button onClick={() => showRef.current?.setCameraPreset('gi')}>Lihat dinding merah / biru →</Button>
+              </Section>
+
+              <Section title="Refraksi & dispersi">
+                <Toggle label="Refraksi screen-space" hint="ray-march depth" value={s.refrSS} onChange={(v) => set('refrSS', v)} />
+                {s.refrSS && (
+                  <>
+                    <Slider label="Pembengkokan lensa" hint="slab ↔ lensa penuh" value={s.refrBend} min={0} max={1} step={0.01} onChange={(v) => set('refrBend', v)} />
+                    <Segmented label="Langkah ray" value={s.refrSteps} options={[{ label: '12', value: 12 }, { label: '24', value: 24 }, { label: '40', value: 40 }, { label: '64', value: 64 }]} onChange={(v) => set('refrSteps', v)} />
+                  </>
+                )}
+                <Slider label="Dispersi kromatik" hint="pelangi di tepi kaca" value={s.dispersion} min={0} max={4} step={0.05} onChange={(v) => set('dispersion', v)} fmt={(v) => '×' + v.toFixed(2)} />
+                <Button onClick={() => showRef.current?.setCameraPreset('glass')}>Lihat lensa &amp; prisma →</Button>
+              </Section>
+
+              <Section title="Parallax occlusion mapping">
+                <Toggle label="Aktifkan POM" hint="kedalaman nyata" value={s.pom} onChange={(v) => set('pom', v)} />
+                {s.pom && (
+                  <>
+                    <Slider label="Kedalaman relief" hint="× dasar material" value={s.pomDepth} min={0} max={3} step={0.05} onChange={(v) => set('pomDepth', v)} fmt={(v) => '×' + v.toFixed(2)} />
+                    <Slider label="Kualitas ray-march" value={s.pomQuality} min={0.25} max={1} step={0.05} onChange={(v) => set('pomQuality', v)} fmt={(v) => (v * 100).toFixed(0) + '%'} />
+                    <Segmented label="Langkah maksimum" value={s.pomSteps} options={[{ label: '16', value: 16 }, { label: '32', value: 32 }, { label: '40', value: 40 }, { label: '64', value: 64 }]} onChange={(v) => set('pomSteps', v)} />
+                    <Slider label="Self-shadow relief" value={s.pomShadow} min={0} max={1} step={0.01} onChange={(v) => set('pomShadow', v)} />
+                    <Slider label="Cavity occlusion" value={s.pomAO} min={0} max={1} step={0.01} onChange={(v) => set('pomAO', v)} />
+                  </>
+                )}
+                <Button onClick={() => showRef.current?.setCameraPreset('relief')}>Lihat panel relief →</Button>
+              </Section>
+
               <Section title="Temporal AA (TAA)">
                 <Toggle label="Aktifkan TAA" hint="matikan MSAA untuk performa" value={s.taa} onChange={(v) => set('taa', v)} />
                 {s.taa && (
@@ -940,6 +1041,15 @@ export default function App() {
                   {mat.iridescence > 0 && <Slider label="Tebal film" value={mat.iridescenceThickness} min={80} max={900} step={5} onChange={(v) => { mat.iridescenceThickness = v; bump(); }} fmt={(v) => v.toFixed(0) + ' nm'} />}
                   <Slider label="Subsurface (lilin/kulit)" value={mat.subsurface} min={0} max={1} step={0.01} onChange={(v) => { mat.subsurface = v; bump(); }} />
                   {mat.subsurface > 0 && <ColorField label="Warna subsurface" value={mat.subsurfaceColor.getHexString()} onChange={(h) => { mat.subsurfaceColor.setStyle(h); bump(); }} />}
+                  {mat.transmission > 0 && <Slider label="Dispersi" hint="pelangi" value={mat.dispersion} min={0} max={10} step={0.05} onChange={(v) => { mat.dispersion = v; bump(); }} />}
+                  {mat.heightMap && (
+                    <>
+                      <div className="pt-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">Parallax occlusion</div>
+                      <Slider label="Kedalaman relief" value={mat.parallaxScale} min={0} max={0.15} step={0.0025} onChange={(v) => { mat.parallaxScale = v; bump(); }} fmt={(v) => (v * 100).toFixed(1) + ' cm'} />
+                      <Slider label="Self-shadow" value={mat.parallaxSelfShadow} min={0} max={1} step={0.01} onChange={(v) => { mat.parallaxSelfShadow = v; bump(); }} />
+                      <Slider label="Cavity AO" value={mat.parallaxAO} min={0} max={1} step={0.01} onChange={(v) => { mat.parallaxAO = v; bump(); }} />
+                    </>
+                  )}
                   {mat.waves > 0 && <Slider label="Gelombang air" value={mat.waves} min={0} max={0.12} step={0.002} onChange={(v) => { mat.waves = v; bump(); }} />}
                 </>
               )}
@@ -956,7 +1066,7 @@ export default function App() {
               <div>
                 <h2 className="text-xl font-semibold text-white">Lumina Engine</h2>
                 <p className="text-sm text-slate-400">
-                  Library rendering WebGL2 ala three.js — fokus pada performa dan realisme fisik. Seluruh kode ada di <code className="text-sky-300">src/lumina/</code>.
+                  Library rendering WebGL2 (Lumina 3) — fokus pada performa dan realisme ala game engine: SSGI, POM, refraksi + dispersi. Seluruh kode ada di <code className="text-sky-300">src/lumina/</code>.
                 </p>
               </div>
               <button onClick={() => setAbout(false)} className="rounded-md px-2 py-1 text-slate-400 hover:bg-white/10 hover:text-white">

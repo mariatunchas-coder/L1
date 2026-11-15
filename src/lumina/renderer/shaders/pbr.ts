@@ -52,7 +52,7 @@ export const pbrFrag = /* glsl */ `
 #include <ubo_camera>
 #include <ubo_lights>
 #include <brdf>
-#if defined(USE_CONTACT) || defined(USE_WATER)
+#if defined(USE_CONTACT) || defined(USE_WATER) || defined(USE_SSREFRACT)
 #include <depth_util>
 #endif
 
@@ -94,8 +94,19 @@ uniform sampler2D uTransmissionTex;
 #ifdef USE_WATER
 uniform vec4 uWave;          // x = amplitude, y = scale, z = speed
 #endif
-#if defined(USE_CONTACT) || defined(USE_WATER)
+#if defined(USE_CONTACT) || defined(USE_WATER) || defined(USE_SSREFRACT)
 uniform sampler2D uSceneDepth;
+#endif
+#ifdef USE_SSREFRACT
+uniform vec4 uRefr;          // x = lens bend (0 slab … 1 full refracted ray), y = march steps, z = max ray length (m), w = hit thickness (m)
+#endif
+#ifdef USE_DISPERSION
+uniform float uDisp;         // KHR_materials_dispersion (20 / Abbe number)
+#endif
+#ifdef USE_HEIGHT
+uniform sampler2D uHeightMap;
+uniform vec4 uPOM;           // x = relief depth (m), y = min steps, z = max steps, w = fade-out distance (m)
+uniform vec4 uPOM2;          // x = self shadow, y = cavity AO, z = quality scale
 #endif
 #ifdef USE_CONTACT
 uniform vec4 uContact;       // x = ray length (m), y = thickness (m), z = strength
@@ -113,6 +124,14 @@ uniform sampler2DArrayShadow uShadowMap;
 #endif
 #ifdef USE_SSAO
 uniform sampler2D uAoTex;
+#endif
+
+// With parallax mapping the uv jumps between ray-march layers, so every fetch must use the gradients of the
+// undisplaced uv (otherwise the hardware mip selection shows seams). uvDx / uvDy are declared in main().
+#ifdef USE_HEIGHT
+  #define TEX(s, c) textureGrad(s, c, uvDx, uvDy)
+#else
+  #define TEX(s, c) texture(s, c)
 #endif
 
 #ifdef UNLIT
@@ -349,28 +368,104 @@ float contactShadow(vec3 wp, vec3 Ng, vec3 L) {
 }
 #endif
 
+#ifdef USE_HEIGHT
+// ───────────── Parallax Occlusion Mapping ─────────────
+// Depth (m) of the relief below the top surface at texture coordinate c.
+float pomSurfaceDepth(vec2 c, vec2 dx, vec2 dy, float amount) {
+  return (1.0 - textureGrad(uHeightMap, c, dx, dy).r) * amount;
+}
+// World-space displacement inside the tangent plane → uv displacement (dual basis of dP/du, dP/dv).
+vec2 pomWorldToUv(vec3 s, vec3 Ng, vec3 dPdu, vec3 dPdv) {
+  vec3 cu = cross(dPdv, Ng);
+  vec3 cv = cross(Ng, dPdu);
+  float du = dot(dPdu, cu);
+  float dv = dot(dPdv, cv);
+  du = abs(du) > 1e-12 ? du : 1e-12;
+  dv = abs(dv) > 1e-12 ? dv : 1e-12;
+  return vec2(dot(s, cu) / du, dot(s, cv) / dv);
+}
+#endif
+
 #ifdef USE_TRANSMISSION
+vec3 safeRefract(vec3 I, vec3 N, float eta, vec3 fallback) {
+  vec3 r = refract(I, N, eta);
+  return dot(r, r) < 1e-6 ? fallback : normalize(r);
+}
+vec2 projectToUv(vec3 wp, out float ok) {
+  vec4 c = uViewProj * vec4(wp, 1.0);
+  ok = c.w > 1e-4 ? 1.0 : 0.0;
+  return c.w > 1e-4 ? c.xy / c.w * 0.5 + 0.5 : vec2(0.5);
+}
+#ifdef USE_SSREFRACT
+// Screen-space refraction: marches the refracted ray through the depth buffer of the opaque scene
+// (quadratic step spacing: fine near the glass, coarse far away) and refines the hit with a binary search.
+// Returns the hit distance along 'dir'; 'found' = 1 on a real hit, otherwise the ray end (sky / off-screen).
+float refractMarch(vec3 P, vec3 dir, out float found, out float inside) {
+  float maxDist = uRefr.z;
+  int steps = int(uRefr.y);
+  float jitter = interleavedGradientNoise(gl_FragCoord.xy) * 0.25;
+  float tPrev = 0.0;
+  found = 0.0;
+  inside = 1.0;
+  float lastGood = 0.0;
+  {
+    // the start point already lies behind an opaque surface (an object sits inside the volume) → that is the hit
+    float ok0;
+    vec2 uv0 = projectToUv(P, ok0);
+    if (ok0 > 0.5 && uv0.x > 0.0 && uv0.x < 1.0 && uv0.y > 0.0 && uv0.y < 1.0) {
+      float sd0 = linZ(texture(uSceneDepth, uv0).r);
+      if (-(uView * vec4(P, 1.0)).z - sd0 > 0.0) { found = 1.0; return 0.0; }
+    }
+  }
+  for (int i = 0; i < 64; i++) {
+    if (i >= steps) break;
+    float f = (float(i) + 1.0 + jitter - 0.25) / float(steps);
+    float t = maxDist * f * f;
+    vec3 wp = P + dir * t;
+    float ok;
+    vec2 suv = projectToUv(wp, ok);
+    if (ok < 0.5 || suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) { inside = 0.0; break; }
+    lastGood = t;
+    float sd = linZ(texture(uSceneDepth, suv).r);
+    float rz = -(uView * vec4(wp, 1.0)).z;
+    float diff = rz - sd;
+    if (diff > 0.0 && diff < uRefr.w + rz * 0.02) {
+      float lo = tPrev, hi = t;
+      for (int j = 0; j < 5; j++) {
+        float mid = 0.5 * (lo + hi);
+        vec3 mp = P + dir * mid;
+        float ok2;
+        vec2 muv = projectToUv(mp, ok2);
+        float mz = -(uView * vec4(mp, 1.0)).z;
+        if (mz - linZ(texture(uSceneDepth, muv).r) > 0.0) hi = mid; else lo = mid;
+      }
+      found = 1.0;
+      return hi;
+    }
+    tPrev = t;
+  }
+  return inside > 0.5 ? maxDist : lastGood;
+}
+#endif
+
 // Refraction of the opaque scene (already resolved + mip-chained) with volume absorption.
 vec3 getTransmission(vec3 N, vec3 V, vec3 baseCol, float roughness, float NoV, vec3 specAlbedo, out float behindDist) {
   float ior = max(uTrans.w, 1.0);
-  vec3 rdir = refract(-V, N, 1.0 / ior);
-  if (dot(rdir, rdir) < 1e-6) rdir = -V;
-  rdir = normalize(rdir);
+  vec3 rdir = safeRefract(-V, N, 1.0 / ior, -V);
   vec2 screenUv = gl_FragCoord.xy * uScreen.zw;
   float travel = uTrans.y;
+  float lod = roughness * log2(max(uScreen.x, uScreen.y)) * clamp(ior * 2.0 - 2.0, 0.0, 1.0);
+  behindDist = 0.0;
 #ifdef USE_WATER
   float surfZ = linZ(gl_FragCoord.z);
   float sd0 = texture(uSceneDepth, screenUv).r;
   float behind0 = sd0 >= 1.0 ? 60.0 : max(linZ(sd0) - surfZ, 0.0);
   travel = min(behind0, 2.0) * 0.85;
-#endif
   vec3 exitPos = vWorldPos + rdir * travel;
   vec4 clip = uViewProj * vec4(exitPos, 1.0);
   vec2 uv = clip.w > 1e-4 ? clip.xy / clip.w * 0.5 + 0.5 : screenUv;
   uv = clamp(uv, vec2(0.002), vec2(0.998));
   float pathLen = travel;
-  behindDist = 0.0;
-#ifdef USE_WATER
   float sd1 = texture(uSceneDepth, uv).r;
   if (sd1 < gl_FragCoord.z - 1e-6) {   // refracted lookup landed on something in front of the water: don't leak it
     uv = screenUv;
@@ -378,20 +473,176 @@ vec3 getTransmission(vec3 N, vec3 V, vec3 baseCol, float roughness, float NoV, v
   }
   behindDist = sd1 >= 1.0 ? 60.0 : max(linZ(sd1) - surfZ, 0.0);
   pathLen = behindDist / max(NoV, 0.3);
-#endif
-  float lod = roughness * log2(max(uScreen.x, uScreen.y)) * clamp(ior * 2.0 - 2.0, 0.0, 1.0);
   vec3 scene = textureLod(uTransmissionTex, uv, lod).rgb;
   vec3 T = exp(-uAttCoeff * pathLen);
   return baseCol * scene * T * (1.0 - specAlbedo);
+#else
+  // per-channel refraction directions (dispersion splits the image into R / G / B copies)
+  vec3 dirR = rdir;
+  vec3 dirB = rdir;
+  #ifdef USE_DISPERSION
+  {
+    float spread = (ior - 1.0) * 0.025 * uDisp;
+    dirR = safeRefract(-V, N, 1.0 / max(ior - spread, 1.0), rdir);
+    dirB = safeRefract(-V, N, 1.0 / (ior + spread), rdir);
+  }
+  #endif
+  vec3 envI = vec3(uEnvParams.x);
+  vec2 cl = vec2(0.002), ch = vec2(0.998);
+  #ifdef USE_SSREFRACT
+  // 1. the ray travels through the volume (thickness) and leaves it at 'exitPos'
+  // 2. from there it is marched through the opaque depth buffer along the (partly bent) outgoing direction
+  vec3 exitG = vWorldPos + rdir * travel;
+  vec3 outG = normalize(mix(-V, rdir, uRefr.x));
+  float found;
+  float inside;
+  float hitT = refractMarch(exitG, outG, found, inside);
+  float okG, okR, okB;
+  vec2 uvG = projectToUv(exitG + outG * hitT, okG);
+  vec2 uvR = uvG;
+  vec2 uvB = uvG;
+  #ifdef USE_DISPERSION
+  {
+    // the red / blue rays leave at slightly different angles: exaggerated ×2 so the fringes read at screen scale
+    vec3 outR = normalize(outG + (dirR - rdir) * 2.0);
+    vec3 outB = normalize(outG + (dirB - rdir) * 2.0);
+    uvR = projectToUv(vWorldPos + dirR * travel + outR * hitT, okR);
+    uvB = projectToUv(vWorldPos + dirB * travel + outB * hitT, okB);
+  }
+  #endif
+  // never show an opaque object that stands in front of the glass: fall back to the undistorted lookup
+  float surfZ = linZ(gl_FragCoord.z);
+  vec2 sUv = gl_FragCoord.xy * uScreen.zw;
+  vec2 cg = clamp(uvG, cl, ch);
+  if (linZ(texture(uSceneDepth, cg).r) < surfZ - 0.02) { uvG = uvR = uvB = sUv; }
+  // fade to the (pre-filtered) environment where the ray leaves the screen
+  vec2 e = min(uvG, 1.0 - uvG);
+  float edge = (inside > 0.5 || found > 0.5 ? 1.0 : 0.0) * smoothstep(0.0, 0.06, min(e.x, e.y));
+  #else
+  // legacy thickness based lookup (Khronos): exit point of the volume projected to the screen
+  float okG, okR, okB;
+  vec2 uvG = projectToUv(vWorldPos + rdir * travel, okG);
+  vec2 uvR = uvG;
+  vec2 uvB = uvG;
+  #ifdef USE_DISPERSION
+  uvR = projectToUv(vWorldPos + dirR * travel, okR);
+  uvB = projectToUv(vWorldPos + dirB * travel, okB);
+  #endif
+  float edge = 1.0;
+  #endif
+  uvG = clamp(uvG, cl, ch);
+  uvR = clamp(uvR, cl, ch);
+  uvB = clamp(uvB, cl, ch);
+  // anti-aliasing: where the refraction minifies the background (lens-like compression) pick a coarser mip
+  vec2 gx = dFdx(uvG) * uScreen.xy;
+  vec2 gy = dFdy(uvG) * uScreen.xy;
+  // capped: at uv discontinuities (object silhouettes inside the glass) the derivative explodes and would smear a jagged ring
+  lod = max(lod, min(0.5 * log2(max(max(dot(gx, gx), dot(gy, gy)), 1.0)), 2.5));
+  vec3 sceneCol;
+  #ifdef USE_DISPERSION
+  sceneCol = vec3(textureLod(uTransmissionTex, uvR, lod).r, textureLod(uTransmissionTex, uvG, lod).g, textureLod(uTransmissionTex, uvB, lod).b);
+  #else
+  sceneCol = textureLod(uTransmissionTex, uvG, lod).rgb;
+  #endif
+  #ifdef USE_SSREFRACT
+  if (edge < 0.999) {
+    float envLod = clamp(lod * 0.55 + roughness * uEnvParams.y, 0.0, uEnvParams.y);
+    vec3 envC = textureLod(uPrefilter, rdir, envLod).rgb;
+    #ifdef USE_DISPERSION
+    envC = vec3(textureLod(uPrefilter, dirR, envLod).r, envC.g, textureLod(uPrefilter, dirB, envLod).b);
+    #endif
+    envC *= envI;
+    sceneCol = mix(envC, sceneCol, edge);
+  }
+  #endif
+  vec3 T = exp(-uAttCoeff * travel);
+  return baseCol * sceneCol * T * (1.0 - specAlbedo);
+#endif
 }
 #endif
 
 void main() {
   vec2 uv = vUv * uUvTransform.xy + uUvTransform.zw;
+  vec2 uvDx = dFdx(uv);
+  vec2 uvDy = dFdy(uv);
+
+  // ── geometric normal / view vector (needed before any texture fetch: parallax displaces the uv) ──
+  vec3 V = normalize(uCamPos.xyz - vWorldPos);
+  vec3 Ng = normalize(vNormal);
+#ifdef DOUBLE_SIDED
+  if (!gl_FrontFacing) Ng = -Ng;
+#endif
+
+  float pomDepth01 = 0.0;   // 0 = top of the relief, 1 = deepest point
+  float pomShadow = 1.0;
+  float pomMetersU = 1.0;   // world metres per uv unit (used to derive normals from the height field)
+  float pomMetersV = 1.0;
+#ifdef USE_HEIGHT
+  {
+    float camDist = length(uCamPos.xyz - vWorldPos);
+    float fade = 1.0 - smoothstep(uPOM.w * 0.55, uPOM.w, camDist);
+    float amount = uPOM.x * fade;
+    vec3 pdp1 = dFdx(vWorldPos);
+    vec3 pdp2 = dFdy(vWorldPos);
+    float det = uvDx.x * uvDy.y - uvDy.x * uvDx.y;
+    float NoVg = dot(V, Ng);
+    if (abs(det) > 1e-20) {
+      vec3 dPdu = (pdp1 * uvDy.y - pdp2 * uvDx.y) / det;
+      vec3 dPdv = (pdp2 * uvDx.x - pdp1 * uvDy.x) / det;
+      pomMetersU = max(length(dPdu), 1e-5);
+      pomMetersV = max(length(dPdv), 1e-5);
+      if (amount > 1e-4 && NoVg > 0.02) {
+        // world shift per metre of depth along the view ray (capped at grazing angles)
+        vec3 sV = -(V - Ng * NoVg) / max(NoVg, 0.12);
+        vec2 duvDepth = pomWorldToUv(sV, Ng, dPdu, dPdv);
+        float n = clamp(floor(mix(uPOM.z, uPOM.y, saturate(NoVg)) * uPOM2.z + 0.5), 4.0, 64.0);
+        int steps = int(n);
+        float layer = amount / n;
+        float t = 0.0;
+        float tHit = amount;
+        for (int i = 0; i < 64; i++) {
+          if (i >= steps) break;
+          float tn = t + layer;
+          float dN = pomSurfaceDepth(uv + duvDepth * tn, uvDx, uvDy, amount) - tn;
+          if (dN <= 0.0) {
+            float lo = t, hi = tn;
+            for (int j = 0; j < 6; j++) {   // binary refinement of the crossing → no visible layer stepping
+              float mid = 0.5 * (lo + hi);
+              if (pomSurfaceDepth(uv + duvDepth * mid, uvDx, uvDy, amount) - mid > 0.0) lo = mid; else hi = mid;
+            }
+            tHit = 0.5 * (lo + hi);
+            break;
+          }
+          t = tn;
+        }
+        uv += duvDepth * tHit;
+        pomDepth01 = saturate(tHit / amount);
+
+        // self shadowing: height-field ray march from the displaced point toward the sun
+        if (uPOM2.x > 0.001 && tHit > 1e-5) {
+          vec3 Ls = uSunDir.xyz;
+          float NoLg = dot(Ls, Ng);
+          if (NoLg > 0.03) {
+            vec3 sL = (Ls - Ng * NoLg) / max(NoLg, 0.1);
+            vec2 duvL = pomWorldToUv(sL, Ng, dPdu, dPdv);
+            float sh = 1.0;
+            for (int k = 1; k <= 12; k++) {
+              float f = float(k) / 12.0;
+              float tau = tHit * f;
+              float blocked = (tHit - tau) - pomSurfaceDepth(uv + duvL * tau, uvDx, uvDy, amount) - amount * 0.012;
+              if (blocked > 0.0) sh = min(sh, 1.0 - saturate(blocked / (amount * 0.12)) * (1.0 - 0.5 * f));
+            }
+            pomShadow = mix(1.0, sh, uPOM2.x * fade);
+          }
+        }
+      }
+    }
+  }
+#endif
 
   vec4 base = uBaseColor;
 #ifdef USE_MAP
-  base *= texture(uMap, uv);
+  base *= TEX(uMap, uv);
 #endif
   base.rgb *= vColor;
 #ifdef ALPHA_TEST
@@ -402,20 +653,18 @@ void main() {
   float metalness = uRoughMetal.y;
   float ao = 1.0;
 #ifdef USE_ORM
-  vec3 orm = texture(uOrmMap, uv).rgb;
+  vec3 orm = TEX(uOrmMap, uv).rgb;
   ao = mix(1.0, orm.r, uAoStrength);
   roughness *= orm.g;
   metalness *= orm.b;
 #endif
   roughness = clamp(roughness, 0.045, 1.0);
   metalness = saturate(metalness);
-
-  // ── geometry / shading normal ──
-  vec3 V = normalize(uCamPos.xyz - vWorldPos);
-  vec3 Ng = normalize(vNormal);
-#ifdef DOUBLE_SIDED
-  if (!gl_FrontFacing) Ng = -Ng;
+#ifdef USE_HEIGHT
+  ao *= 1.0 - uPOM2.y * 0.8 * pomDepth01;   // cavity occlusion: the deeper the ray went, the less sky it sees
 #endif
+
+  // ── shading normal ──
   vec3 N = Ng;
 #ifdef USE_WATER
   {
@@ -425,7 +674,7 @@ void main() {
     N = normalize(Ng + vec3(-wg.x, 0.0, -wg.y));
   }
 #endif
-#if defined(USE_NORMALMAP) || defined(USE_ANISO)
+#if defined(USE_NORMALMAP) || defined(USE_ANISO) || defined(USE_HEIGHT)
   vec3 Tg;
   vec3 Bg;
   #ifdef USE_TANGENT
@@ -434,7 +683,7 @@ void main() {
     Bg = cross(Ng, Tg) * vTangent.w;
   #else
     vec3 dp1 = dFdx(vWorldPos), dp2 = dFdy(vWorldPos);
-    vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
+    vec2 duv1 = uvDx, duv2 = uvDy;
     vec3 dp2perp = cross(dp2, Ng), dp1perp = cross(Ng, dp1);
     vec3 T0 = dp2perp * duv1.x + dp1perp * duv2.x;
     vec3 B0 = dp2perp * duv1.y + dp1perp * duv2.y;
@@ -444,9 +693,21 @@ void main() {
   #endif
 #endif
 #ifdef USE_NORMALMAP
-  vec3 tn = texture(uNormalMap, uv).xyz * 2.0 - 1.0;
+  vec3 tn = TEX(uNormalMap, uv).xyz * 2.0 - 1.0;
   tn.xy *= uNormalScale;
   N = normalize(mat3(Tg, Bg, Ng) * tn);
+#elif defined(USE_HEIGHT)
+  {
+    // no normal map: derive the shading normal from the height field (central differences, metric slope)
+    vec2 ts = 1.0 / vec2(textureSize(uHeightMap, 0));
+    float hL = textureGrad(uHeightMap, uv - vec2(ts.x, 0.0), uvDx, uvDy).r;
+    float hR = textureGrad(uHeightMap, uv + vec2(ts.x, 0.0), uvDx, uvDy).r;
+    float hD = textureGrad(uHeightMap, uv - vec2(0.0, ts.y), uvDx, uvDy).r;
+    float hU = textureGrad(uHeightMap, uv + vec2(0.0, ts.y), uvDx, uvDy).r;
+    float gx = (hR - hL) * uPOM.x / (2.0 * ts.x * pomMetersU);
+    float gy = (hU - hD) * uPOM.x / (2.0 * ts.y * pomMetersV);
+    N = normalize(mat3(Tg, Bg, Ng) * normalize(vec3(-gx * uNormalScale, -gy * uNormalScale, 1.0)));
+  }
 #endif
 
   // ── specular anti-aliasing (Tokuyoshi & Kaplanyan) – removes shimmering on bumpy / distant surfaces ──
@@ -527,6 +788,7 @@ void main() {
 #ifdef USE_CONTACT
     if (NoLs > 0.0 && shadow > 0.0) shadow = min(shadow, contactShadow(vWorldPos, Ng, L));
 #endif
+    shadow *= pomShadow;
     if (shadow > 0.0) evalLight(s, L, uSunColor.rgb * shadow, diffuse, specular);
   }
 
@@ -604,7 +866,7 @@ void main() {
 
   vec3 emissive = uEmissive;
 #ifdef USE_EMISSIVEMAP
-  emissive *= texture(uEmissiveMap, uv).rgb;
+  emissive *= TEX(uEmissiveMap, uv).rgb;
 #endif
 
   float outAlpha = base.a;
@@ -705,6 +967,10 @@ layout(location = 5) in vec4 aIM1;
 layout(location = 6) in vec4 aIM2;
 layout(location = 7) in vec4 aIM3;
 #endif
+#ifdef INSTANCED_COLOR
+layout(location = 8) in vec3 aInstanceColor;
+out vec3 vColor;
+#endif
 uniform mat4 uModel;
 uniform mat4 uPrevModel;
 uniform mat3 uNormalMatrix;
@@ -726,6 +992,9 @@ void main() {
   vec4 wp = model * vec4(aPosition, 1.0);
   vNormal = nm * aNormal;
   vUv = aUv;
+#ifdef INSTANCED_COLOR
+  vColor = aInstanceColor;
+#endif
   vCurr = uViewProjUnjit * wp;
   vPrev = uPrevViewProj * (prevModel * vec4(aPosition, 1.0));
   gl_Position = uViewProj * wp;
@@ -735,10 +1004,16 @@ void main() {
 export const gbufFrag = /* glsl */ `
 layout(location = 0) out vec4 outVelNormal;
 layout(location = 1) out vec4 outMaterial;
+#ifdef GBUF_ALBEDO
+layout(location = 2) out vec4 outAlbedo;
+#endif
 in vec3 vNormal;
 in vec2 vUv;
 in vec4 vCurr;
 in vec4 vPrev;
+#ifdef INSTANCED_COLOR
+in vec3 vColor;
+#endif
 uniform vec4 uBaseColor;
 uniform vec2 uRoughMetal;
 uniform vec4 uUvTransform;
@@ -780,6 +1055,17 @@ void main() {
   outMaterial = vec4(0.0, 0.0, 0.0, 1.0);
 #else
   outMaterial = vec4(mix(vec3(0.04), base.rgb, clamp(metalness, 0.0, 1.0)), roughness);
+#endif
+#ifdef GBUF_ALBEDO
+  #ifdef UNLIT
+  outAlbedo = vec4(0.0);
+  #else
+  vec3 albedoRgb = base.rgb;
+    #ifdef INSTANCED_COLOR
+  albedoRgb *= vColor;
+    #endif
+  outAlbedo = vec4(sqrt(max(albedoRgb * (1.0 - clamp(metalness, 0.0, 1.0)), vec3(0.0))), 1.0);
+  #endif
 #endif
 }
 `;

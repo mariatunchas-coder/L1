@@ -65,6 +65,7 @@ const SUPPORTED_EXT = new Set([
   'KHR_materials_clearcoat',
   'KHR_materials_transmission',
   'KHR_materials_ior',
+  'KHR_materials_dispersion',
   'KHR_materials_volume',
   'KHR_materials_sheen',
   'KHR_materials_specular',
@@ -517,6 +518,7 @@ class GLTFParser {
         if (vol.thicknessTexture) this.warn('thickTex', 'Thickness textures are ignored (the uniform thickness factor is used).');
       }
       if (ext.KHR_materials_ior && typeof ext.KHR_materials_ior.ior === 'number') m.ior = Math.max(1, ext.KHR_materials_ior.ior);
+      if (ext.KHR_materials_dispersion && typeof ext.KHR_materials_dispersion.dispersion === 'number') m.dispersion = Math.max(0, ext.KHR_materials_dispersion.dispersion);
       const sh = ext.KHR_materials_sheen;
       if (sh) {
         const sc: number[] = sh.sheenColorFactor ?? [0, 0, 0];

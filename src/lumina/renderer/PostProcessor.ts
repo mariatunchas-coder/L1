@@ -5,7 +5,7 @@ import { ColorTarget, GBufferTarget, createColorTarget, deleteColorTarget } from
 import { fullscreenVert } from './shaders/ibl';
 import { adaptFrag, bloomDownFrag, bloomUpFrag, compositeFrag, lensFlareFrag, lumFrag, ssaoBlurFrag, ssaoFrag } from './shaders/post';
 import { volumetricBlurFrag, volumetricFrag } from './shaders/volumetric';
-import { dofFrag, motionBlurFrag, ssrApplyFrag, ssrTraceFrag, taaFrag } from './shaders/effects';
+import { dofFrag, motionBlurFrag, ssgiApplyFrag, ssgiBlurFrag, ssgiTemporalFrag, ssgiTraceFrag, ssrApplyFrag, ssrTraceFrag, taaFrag } from './shaders/effects';
 import { TEX_CUBE } from './GLState';
 
 export type ToneMapping = 'none' | 'reinhard' | 'aces' | 'neutral' | 'filmic' | 'agx';
@@ -60,6 +60,44 @@ export interface PostSettings {
     /** Ray-march steps (8 – 128). */
     steps: number;
   };
+  /**
+   * Screen-space global illumination (Lumen-style diffuse colour bleeding). Half-resolution cosine-weighted ray march
+   * through the depth buffer, gathering the radiance of the lit frame, then temporal accumulation + bilateral blur.
+   * Needs the G-buffer (enables it automatically).
+   */
+  ssgi: {
+    enabled: boolean;
+    /** Strength of the bounce light (1 = physically scaled). */
+    intensity: number;
+    /** Maximum distance a bounce ray travels (m). */
+    radius: number;
+    /** Depth thickness (m) behind a surface still counted as a hit. */
+    thickness: number;
+    /** Rays per half-res pixel and frame (1 – 4). */
+    rays: number;
+    /** Ray-march steps per ray (6 – 32). */
+    steps: number;
+    /** Weight of the temporal history (0.8 – 0.97). */
+    feedback: number;
+    /** Spatial denoise radius in half-res pixels (0 = off). */
+    blur: number;
+    /** Firefly clamp: largest radiance a single hit may contribute. */
+    maxRadiance: number;
+    /** Show only the bounce light. */
+    debug: boolean;
+  };
+  /** Refraction of glass / liquids (`transmission > 0`). */
+  refraction: {
+    /** Ray-march the refracted ray through the opaque depth buffer (parallax-correct) instead of a thickness offset. */
+    screenSpace: boolean;
+    steps: number;
+    /** Longest refracted ray (m). */
+    maxDistance: number;
+    /** Depth thickness (m) for a hit. */
+    thickness: number;
+    /** 0 = flat slab (glTF reference: the view ray only shifts) … 1 = the fully refracted ray (strong lens distortion). */
+    bend: number;
+  };
   /** Thin-lens depth of field. */
   dof: {
     enabled: boolean;
@@ -111,6 +149,8 @@ export function defaultPostSettings(): PostSettings {
     contactShadows: { enabled: false, length: 0.7, thickness: 0.5, strength: 0.85 },
     taa: { enabled: false, feedback: 0.9, jitter: 1 },
     ssr: { enabled: false, intensity: 1, maxDistance: 40, thickness: 0.6, maxRoughness: 0.6, steps: 64 },
+    ssgi: { enabled: false, intensity: 1, radius: 6, thickness: 0.6, rays: 2, steps: 16, feedback: 0.92, blur: 3, maxRadiance: 12, debug: false },
+    refraction: { screenSpace: true, steps: 24, maxDistance: 14, thickness: 1.2, bend: 0.4 },
     dof: { enabled: false, focusDistance: 12, focalLength: 50, fStop: 2.8, maxBlur: 12, taps: 28 },
     motionBlur: { enabled: false, intensity: 0.5, samples: 12 },
     volumetricFog: {
@@ -147,6 +187,15 @@ export class PostProcessor {
   private motionBlurProg: Program;
   private flareProg: Program;
   private flareRT: ColorTarget | null = null;
+  private giTraceProg: Program;
+  private giTemporalProg: Program;
+  private giBlurProg: Program;
+  private giApplyProg: Program;
+  private giTrace: ColorTarget | null = null;
+  private giOut: ColorTarget | null = null;
+  private giHist: ColorTarget[] = [];
+  private giIdx = 0;
+  private giValid = false;
 
   // lazily created full-frame targets for the G-buffer driven effects
   private fx: ColorTarget[] = [];
@@ -187,6 +236,10 @@ export class PostProcessor {
     this.dofProg = mk(dofFrag, 'dof');
     this.motionBlurProg = mk(motionBlurFrag, 'motionBlur');
     this.flareProg = mk(lensFlareFrag, 'lensFlare');
+    this.giTraceProg = mk(ssgiTraceFrag, 'ssgiTrace');
+    this.giTemporalProg = mk(ssgiTemporalFrag, 'ssgiTemporal');
+    this.giBlurProg = mk(ssgiBlurFrag, 'ssgiBlur');
+    this.giApplyProg = mk(ssgiApplyFrag, 'ssgiApply');
     this.lum = createColorTarget(gl, state, this.lumSize, this.lumSize, gl.RGBA16F, { mipmaps: true });
     this.adapt = [createColorTarget(gl, state, 1, 1, gl.R16F), createColorTarget(gl, state, 1, 1, gl.R16F)];
   }
@@ -196,8 +249,11 @@ export class PostProcessor {
     const gl = this.gl;
     this.width = w;
     this.height = h;
-    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, ...this.fx, ...this.taaHist, ...this.down, ...this.up])
+    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, this.giTrace, this.giOut, ...this.giHist, ...this.fx, ...this.taaHist, ...this.down, ...this.up])
       deleteColorTarget(gl, this.state, t);
+    this.giTrace = this.giOut = null;
+    this.giHist = [];
+    this.giValid = false;
     this.flareRT = null;
     this.fx = [];
     this.taaHist = [];
@@ -398,6 +454,78 @@ export class PostProcessor {
     this.adaptFirst = false;
   }
 
+  /** Drops the SSGI history (call when the effect was not rendered, or after a camera cut). */
+  resetGI(): void {
+    this.giValid = false;
+  }
+
+  private ensureGI(): void {
+    if (this.giTrace) return;
+    const gl = this.gl;
+    const aw = Math.max(1, Math.ceil(this.width / 2)),
+      ah = Math.max(1, Math.ceil(this.height / 2));
+    this.giTrace = createColorTarget(gl, this.state, aw, ah, gl.RGBA16F, { filter: 'nearest' });
+    this.giOut = createColorTarget(gl, this.state, aw, ah, gl.RGBA16F, { filter: 'nearest' });
+    this.giHist = [0, 1].map(() => createColorTarget(gl, this.state, aw, ah, gl.RGBA16F));
+    this.giValid = false;
+  }
+
+  /**
+   * Screen-space global illumination. Returns the scene colour with the diffuse bounce light added.
+   * Pipeline: half-res trace → temporal accumulation (history is reprojected with the velocity buffer) →
+   * depth/normal-aware blur → full-res bilateral upsample multiplied by the G-buffer albedo.
+   */
+  renderSSGI(sceneTex: WebGLTexture, gb: GBufferTarget, s: PostSettings['ssgi'], w: number, h: number, frame: number, forceReset: boolean): WebGLTexture {
+    const gl = this.gl;
+    this.ensureGI();
+    const trace = this.giTrace!;
+    const out = this.giOut!;
+    const write = this.giHist[this.giIdx];
+    const read = this.giHist[1 - this.giIdx];
+    this.begin();
+
+    this.giTraceProg.use();
+    let L = this.giTraceProg.loc;
+    this.state.bindTexture(0, TEX_2D, gb.texture);
+    this.state.bindTexture(1, TEX_2D, gb.velNormal);
+    this.state.bindTexture(2, TEX_2D, sceneTex);
+    gl.uniform4f(L.uGI, Math.max(0.2, s.radius), Math.max(0.02, s.thickness), Math.max(1, Math.min(4, Math.round(s.rays))), Math.max(6, Math.min(32, Math.round(s.steps))));
+    gl.uniform4f(L.uGI2, frame % 4096, Math.max(0.5, s.maxRadiance), 0, 0);
+    this.pass(trace, w, h);
+
+    this.giTemporalProg.use();
+    L = this.giTemporalProg.loc;
+    this.state.bindTexture(0, TEX_2D, trace.texture);
+    this.state.bindTexture(1, TEX_2D, read.texture);
+    this.state.bindTexture(2, TEX_2D, gb.velNormal);
+    this.state.bindTexture(3, TEX_2D, gb.texture);
+    gl.uniform4f(L.uGIT, Math.min(0.98, Math.max(0, s.feedback)), this.giValid && !forceReset ? 0 : 1, 0, 0);
+    this.pass(write, w, h);
+    this.giIdx = 1 - this.giIdx;
+    this.giValid = true;
+
+    let giTex = write.texture;
+    if (s.blur >= 0.5) {
+      this.giBlurProg.use();
+      this.state.bindTexture(0, TEX_2D, write.texture);
+      this.state.bindTexture(1, TEX_2D, gb.velNormal);
+      this.state.bindTexture(2, TEX_2D, gb.texture);
+      gl.uniform1f(this.giBlurProg.loc.uRadius, Math.min(12, s.blur));
+      this.pass(out, w, h);
+      giTex = out.texture;
+    }
+
+    const dst = this.pickFx(sceneTex);
+    this.giApplyProg.use();
+    this.state.bindTexture(0, TEX_2D, sceneTex);
+    this.state.bindTexture(1, TEX_2D, giTex);
+    this.state.bindTexture(2, TEX_2D, gb.albedo);
+    this.state.bindTexture(3, TEX_2D, gb.texture);
+    gl.uniform4f(this.giApplyProg.loc.uGIA, Math.max(0, s.intensity), s.debug ? 1 : 0, 0, 0);
+    this.pass(dst, w, h);
+    return dst.texture;
+  }
+
   /** Forces the next TAA resolve to start from the current frame only (camera cuts, teleports). */
   resetHistory(): void {
     this.taaValid = false;
@@ -546,7 +674,7 @@ export class PostProcessor {
 
   dispose(): void {
     const gl = this.gl;
-    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, this.lum, ...this.fx, ...this.taaHist, ...this.adapt, ...this.down, ...this.up])
+    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, this.lum, this.giTrace, this.giOut, ...this.giHist, ...this.fx, ...this.taaHist, ...this.adapt, ...this.down, ...this.up])
       deleteColorTarget(gl, this.state, t);
     for (const p of [
       this.ssaoProg,
@@ -565,6 +693,10 @@ export class PostProcessor {
       this.dofProg,
       this.motionBlurProg,
       this.flareProg,
+      this.giTraceProg,
+      this.giTemporalProg,
+      this.giBlurProg,
+      this.giApplyProg,
     ])
       p.dispose();
   }

@@ -1,7 +1,8 @@
 /**
  * Lumina – a performance-first, physically based WebGL2 rendering engine.
  *
- * Features: PBR + IBL (sheen, anisotropy, iridescence, subsurface, refraction/transmission, water),
+ * Features: PBR + IBL (sheen, anisotropy, iridescence, subsurface, refraction/transmission with dispersion, water),
+ * parallax occlusion mapping, screen-space global illumination (SSGI),
  * cascaded + contact shadows, SSAO, SSR, TAA, DoF, motion blur, volumetric fog, procedural clouds,
  * bloom + lens flare, AgX / ACES tone mapping, CDL grading, auto exposure, glTF 2.0 loader,
  * animation, LOD, GPU instancing, static batching, adaptive quality, GPU timing.

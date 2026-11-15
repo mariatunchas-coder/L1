@@ -75,11 +75,14 @@ export function createDepthTarget(gl: WebGL2RenderingContext, state: GLState, wi
  * with `withColor` it additionally stores
  *   RT0 (RGBA16F): xy = screen-space velocity (uv units), zw = octahedral world normal
  *   RT1 (RGBA8)  : rgb = specular F0, a = roughness
+ *   RT2 (RGBA8)  : rgb = sqrt(diffuse albedo), a = 1   (only with `withAlbedo` – screen-space GI)
  */
 export interface GBufferTarget extends DepthTarget {
   hasColor: boolean;
+  hasAlbedo: boolean;
   velNormal: WebGLTexture | null;
   material: WebGLTexture | null;
+  albedo: WebGLTexture | null;
 }
 
 function nearestTexture(gl: WebGL2RenderingContext, state: GLState, w: number, h: number, format: number): WebGLTexture {
@@ -93,32 +96,40 @@ function nearestTexture(gl: WebGL2RenderingContext, state: GLState, w: number, h
   return t;
 }
 
-export function createGBuffer(gl: WebGL2RenderingContext, state: GLState, width: number, height: number, withColor: boolean): GBufferTarget {
+export function createGBuffer(gl: WebGL2RenderingContext, state: GLState, width: number, height: number, withColor: boolean, withAlbedo = false): GBufferTarget {
   const depth = nearestTexture(gl, state, width, height, gl.DEPTH_COMPONENT24);
   const fbo = gl.createFramebuffer()!;
   state.bindFramebuffer(fbo);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0);
   let velNormal: WebGLTexture | null = null;
   let material: WebGLTexture | null = null;
+  let albedo: WebGLTexture | null = null;
   if (withColor) {
     velNormal = nearestTexture(gl, state, width, height, gl.RGBA16F);
     material = nearestTexture(gl, state, width, height, gl.RGBA8);
     state.bindFramebuffer(fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, velNormal, 0);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, material, 0);
-    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+    if (withAlbedo) {
+      albedo = nearestTexture(gl, state, width, height, gl.RGBA8);
+      state.bindFramebuffer(fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, gl.TEXTURE_2D, albedo, 0);
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2]);
+    } else {
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+    }
   } else {
     gl.drawBuffers([gl.NONE]);
     gl.readBuffer(gl.NONE);
   }
   const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
   if (status !== gl.FRAMEBUFFER_COMPLETE) throw new Error('Lumina: G-buffer framebuffer incomplete 0x' + status.toString(16));
-  return { fbo, texture: depth, width, height, hasColor: withColor, velNormal, material };
+  return { fbo, texture: depth, width, height, hasColor: withColor, hasAlbedo: withColor && withAlbedo, velNormal, material, albedo };
 }
 
 export function deleteGBuffer(gl: WebGL2RenderingContext, state: GLState, g: GBufferTarget | null): void {
   if (!g) return;
-  for (const t of [g.texture, g.velNormal, g.material]) {
+  for (const t of [g.texture, g.velNormal, g.material, g.albedo]) {
     if (!t) continue;
     state.forgetTexture(t);
     gl.deleteTexture(t);

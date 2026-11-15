@@ -66,6 +66,15 @@ export interface PBRMaterialParams {
   waves?: number;
   waveScale?: number;
   waveSpeed?: number;
+
+  // ── Lumina 3: dispersion + parallax occlusion mapping ──
+  dispersion?: number;
+  heightMap?: Texture | null;
+  parallaxScale?: number;
+  parallaxMinSteps?: number;
+  parallaxMaxSteps?: number;
+  parallaxSelfShadow?: number;
+  parallaxAO?: number;
 }
 
 /**
@@ -81,6 +90,8 @@ export interface PBRMaterialParams {
  *  - **subsurface**   – wrap-lighting approximation of translucent skin / wax / leaves
  *  - **waves**        – animated procedural water normals with depth-based absorption + shore foam
  *                       (assumes a horizontal surface; use together with `transmission = 1`)
+ *  - **dispersion**   – chromatic splitting of the refracted image (KHR_materials_dispersion, prisms, crystal, diamond)
+ *  - **heightMap**    – Parallax Occlusion Mapping: true per-pixel relief with self-shadowing and cavity occlusion
  *
  * Radiometric units: colours are linear.
  */
@@ -140,6 +151,26 @@ export class PBRMaterial extends Material {
   /** Water: animation speed multiplier. */
   waveSpeed = 1;
 
+  /**
+   * Chromatic dispersion of refraction (KHR_materials_dispersion: 20 / Abbe number).
+   * Crown glass ≈ 0.3, flint ≈ 0.7, diamond ≈ 0.4 – larger values are an artistic exaggeration. Needs `transmission > 0`.
+   */
+  dispersion = 0;
+  /**
+   * Height field (R channel, 1 = top of the relief, 0 = deepest) that enables Parallax Occlusion Mapping.
+   * Without a `normalMap` the shading normal is derived from the height field as well.
+   */
+  heightMap: Texture | null = null;
+  /** Relief depth in metres (distance between the top surface and the deepest point). */
+  parallaxScale = 0.05;
+  /** Ray-march layer count at perpendicular / grazing view (clamped to 4 … 64, scaled by the renderer's parallax quality). */
+  parallaxMinSteps = 10;
+  parallaxMaxSteps = 40;
+  /** 0 … 1 – self shadowing of the relief toward the sun (soft, height-field ray march). */
+  parallaxSelfShadow = 1;
+  /** 0 … 1 – darkens the bottoms of grooves / mortar joints (cavity occlusion from the ray depth). */
+  parallaxAO = 0.5;
+
   constructor(p: PBRMaterialParams = {}) {
     super();
     if (p.color !== undefined) this.color.set(p.color as Color);
@@ -180,6 +211,13 @@ export class PBRMaterial extends Material {
     if (p.waves !== undefined) this.waves = p.waves;
     if (p.waveScale !== undefined) this.waveScale = p.waveScale;
     if (p.waveSpeed !== undefined) this.waveSpeed = p.waveSpeed;
+    if (p.dispersion !== undefined) this.dispersion = p.dispersion;
+    if (p.heightMap !== undefined) this.heightMap = p.heightMap;
+    if (p.parallaxScale !== undefined) this.parallaxScale = p.parallaxScale;
+    if (p.parallaxMinSteps !== undefined) this.parallaxMinSteps = p.parallaxMinSteps;
+    if (p.parallaxMaxSteps !== undefined) this.parallaxMaxSteps = p.parallaxMaxSteps;
+    if (p.parallaxSelfShadow !== undefined) this.parallaxSelfShadow = p.parallaxSelfShadow;
+    if (p.parallaxAO !== undefined) this.parallaxAO = p.parallaxAO;
   }
 
   /** True when the material refracts the scene behind it (drawn after the opaque pass). */

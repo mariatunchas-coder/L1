@@ -62,6 +62,8 @@ export interface PBRTextureSet {
   map: Texture;
   normalMap: Texture;
   ormMap: Texture;
+  /** Height field (R channel, stretched to the full 0…1 range) for Parallax Occlusion Mapping: 1 = top, 0 = deepest. */
+  heightMap: Texture;
 }
 
 const toByte = (v: number) => Math.round(clamp(v, 0, 1) * 255);
@@ -113,8 +115,22 @@ export function buildPBRSet(size: number, normalStrength: number, fn: (u: number
       normal[k + 3] = 255;
     }
   }
+  // height field for parallax occlusion mapping, stretched to the full range so `parallaxScale` is the real relief depth
+  let hMin = Infinity,
+    hMax = -Infinity;
+  for (let k = 0; k < n; k++) {
+    if (height[k] < hMin) hMin = height[k];
+    if (height[k] > hMax) hMax = height[k];
+  }
+  const hRange = Math.max(hMax - hMin, 1e-6);
+  const hdata = new Uint8Array(n * 4);
+  for (let k = 0; k < n; k++) {
+    const v = toByte((height[k] - hMin) / hRange);
+    hdata[k * 4] = hdata[k * 4 + 1] = hdata[k * 4 + 2] = v;
+    hdata[k * 4 + 3] = 255;
+  }
   const mk = (data: Uint8Array, cs: 'srgb' | 'linear') => new Texture({ data, width: size, height: size, colorSpace: cs, anisotropy: 16 });
-  return { map: mk(albedo, 'srgb'), normalMap: mk(normal, 'linear'), ormMap: mk(orm, 'linear') };
+  return { map: mk(albedo, 'srgb'), normalMap: mk(normal, 'linear'), ormMap: mk(orm, 'linear'), heightMap: mk(hdata, 'linear') };
 }
 
 const mix = (a: number, b: number, t: number) => a + (b - a) * t;

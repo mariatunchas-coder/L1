@@ -331,3 +331,244 @@ void main() {
   fragColor = vec4(acc / float(n + 1), 1.0);
 }
 `;
+
+// ═════════════════════════════ Screen-Space Global Illumination ═════════════════════════════
+// Diffuse indirect bounce (Lumen-style colour bleeding) gathered from the already lit frame:
+//   trace (half-res, cosine-weighted rays) → temporal accumulation → bilateral blur → apply × albedo
+
+const ssgiHash = /* glsl */ `
+float giHash(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+`;
+
+export const ssgiTraceFrag = /* glsl */ `
+#include <common>
+#include <ubo_camera>
+#include <depth_util>
+${ssgiHash}
+uniform sampler2D uTex0;   // depth (full-res)
+uniform sampler2D uTex1;   // G-buffer RT0: velocity.xy, oct normal.zw
+uniform sampler2D uTex2;   // lit scene colour (HDR)
+uniform vec4 uGI;          // x = radius (m), y = thickness (m), z = rays, w = steps
+uniform vec4 uGI2;         // x = frame, y = max radiance (firefly clamp)
+in vec2 vUv;
+layout(location = 0) out vec4 fragColor;
+
+vec2 giProject(vec3 vp) {
+  vec4 h = uProj * vec4(vp, 1.0);
+  return h.xy / h.w * 0.5 + 0.5;
+}
+
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  ivec2 fs = textureSize(uTex0, 0);
+  ivec2 fullP = min(ip * 2, fs - 1);
+  fragColor = vec4(0.0);
+  float d = texelFetch(uTex0, fullP, 0).r;
+  if (d >= 1.0) return;
+  vec2 uv = (vec2(fullP) + 0.5) / vec2(fs);
+  vec3 P = viewPosFromDepth(uv, d);
+  vec3 N = normalize(mat3(uView) * octDecode(texelFetch(uTex1, fullP, 0).zw));
+
+  vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+  vec3 T = normalize(cross(up, N));
+  vec3 B = cross(N, T);
+  vec3 O = P + N * (0.012 + 0.004 * -P.z);
+
+  int rays = int(uGI.z);
+  int steps = int(uGI.w);
+  float R = uGI.x;
+  vec3 acc = vec3(0.0);
+  for (int r = 0; r < 4; r++) {
+    if (r >= rays) break;
+    vec2 seed = gl_FragCoord.xy + vec2(uGI2.x * 7.13 + float(r) * 31.7, uGI2.x * 3.31 + float(r) * 17.3);
+    vec2 xi = vec2(giHash(seed), giHash(seed.yx * 1.37 + 19.19));
+    float jit = giHash(seed * 0.73 + 5.5);
+    float phi = TWO_PI * xi.x;
+    float rr = sqrt(xi.y);
+    vec3 dir = normalize(T * (cos(phi) * rr) + B * (sin(phi) * rr) + N * sqrt(max(1.0 - xi.y, 0.0)));
+
+    float maxT = R;
+    if (O.z + dir.z * maxT > -uCamParams.x * 1.01) {
+      if (dir.z < 1e-5) continue;
+      maxT = (-uCamParams.x * 1.01 - O.z) / dir.z;
+    }
+    float tPrev = 0.0;
+    float tHit = -1.0;
+    for (int i = 0; i < 32; i++) {
+      if (i >= steps) break;
+      float f = (float(i) + jit) / float(steps);
+      float t = maxT * f * f;
+      vec3 sp = O + dir * t;
+      vec2 suv = giProject(sp);
+      if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) break;
+      float sd = linZ(textureLod(uTex0, suv, 0.0).r);
+      float rz = -sp.z;
+      float diff = rz - sd;
+      if (diff > 0.02 + rz * 0.004 && diff < uGI.y + (t - tPrev) + rz * 0.01) {
+        float lo = tPrev, hi = t;
+        for (int j = 0; j < 4; j++) {
+          float mid = 0.5 * (lo + hi);
+          vec3 mp = O + dir * mid;
+          if (-mp.z - linZ(textureLod(uTex0, giProject(mp), 0.0).r) > 0.0) hi = mid; else lo = mid;
+        }
+        tHit = hi;
+        break;
+      }
+      tPrev = t;
+    }
+    if (tHit < 0.0) continue;
+    vec2 huv = giProject(O + dir * tHit);
+    ivec2 hp = clamp(ivec2(huv * vec2(fs)), ivec2(0), fs - 1);
+    if (texelFetch(uTex0, hp, 0).r >= 1.0) continue;
+    vec3 Nh = octDecode(texelFetch(uTex1, hp, 0).zw);
+    vec3 dirW = dir * mat3(uView);                   // view → world
+    if (dot(Nh, dirW) > 0.25) continue;              // hit the back of a surface
+    vec2 e = min(huv, 1.0 - huv);
+    float w = (1.0 - smoothstep(0.5 * R, R, tHit)) * smoothstep(0.0, 0.06, min(e.x, e.y));
+    acc += min(textureLod(uTex2, huv, 0.0).rgb, vec3(uGI2.y)) * w;
+  }
+  fragColor = vec4(acc / float(max(rays, 1)), 1.0);
+}
+`;
+
+export const ssgiTemporalFrag = /* glsl */ `
+#include <common>
+#include <ubo_camera>
+#include <depth_util>
+uniform sampler2D uTex0;   // raw trace (half-res)
+uniform sampler2D uTex1;   // history (half-res): rgb = GI, a = linear depth
+uniform sampler2D uTex2;   // G-buffer RT0 (velocity)
+uniform sampler2D uTex3;   // depth (full-res)
+uniform vec4 uGIT;         // x = history weight, y = reset flag
+in vec2 vUv;
+layout(location = 0) out vec4 fragColor;
+
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  ivec2 hs = textureSize(uTex0, 0);
+  ivec2 fs = textureSize(uTex3, 0);
+  ivec2 fullP = min(ip * 2, fs - 1);
+  float d = texelFetch(uTex3, fullP, 0).r;
+  if (d >= 1.0) { fragColor = vec4(0.0); return; }
+  float z = linZ(d);
+  vec3 cur = texelFetch(uTex0, ip, 0).rgb;
+
+  vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      vec3 c = texelFetch(uTex0, clamp(ip + ivec2(dx, dy), ivec2(0), hs - 1), 0).rgb;
+      m1 += c;
+      m2 += c * c;
+    }
+  }
+  vec3 mean = m1 / 9.0;
+  vec3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+
+  vec2 vel = texelFetch(uTex2, fullP, 0).xy;
+  vec2 uv = (vec2(ip) + 0.5) / vec2(hs);
+  vec2 prevUv = uv - vel;
+  vec4 hist = texture(uTex1, prevUv);
+  bool inside = all(greaterThan(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)));
+  bool valid = uGIT.y < 0.5 && inside && abs(hist.a - z) < 0.05 * z + 0.02 && all(lessThan(hist.rgb, vec3(1e4)));
+  float a = 1.0;
+  vec3 h = hist.rgb;
+  if (valid) {
+    vec3 ext = sigma * 1.8 + 0.02;
+    vec3 v = h - mean;
+    float t = max(max(abs(v.x) / ext.x, abs(v.y) / ext.y), abs(v.z) / ext.z);
+    if (t > 1.0) h = mean + v / t;
+    a = clamp(1.0 - uGIT.x, 0.02, 1.0);
+  }
+  fragColor = vec4(mix(h, cur, a), z);
+}
+`;
+
+export const ssgiBlurFrag = /* glsl */ `
+#include <common>
+#include <ubo_camera>
+#include <depth_util>
+${ssgiHash}
+uniform sampler2D uTex0;   // temporal result (half-res)
+uniform sampler2D uTex1;   // G-buffer RT0 (normals)
+uniform sampler2D uTex2;   // depth (full-res)
+uniform float uRadius;     // px (half-res)
+in vec2 vUv;
+layout(location = 0) out vec4 fragColor;
+
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  ivec2 hs = textureSize(uTex0, 0);
+  ivec2 fs = textureSize(uTex2, 0);
+  vec4 c = texelFetch(uTex0, ip, 0);
+  float z = c.a;
+  if (z <= 0.0) { fragColor = c; return; }
+  vec3 Nc = octDecode(texelFetch(uTex1, min(ip * 2, fs - 1), 0).zw);
+  float rot = giHash(gl_FragCoord.xy) * TWO_PI;
+  vec3 acc = c.rgb;
+  float wsum = 1.0;
+  for (int i = 0; i < 16; i++) {
+    vec2 o = vogelDisk(i, 16, rot) * uRadius;
+    ivec2 q = ip + ivec2(floor(o + 0.5));
+    if (q.x < 0 || q.y < 0 || q.x >= hs.x || q.y >= hs.y) continue;
+    vec4 s = texelFetch(uTex0, q, 0);
+    if (s.a <= 0.0) continue;
+    vec3 Nq = octDecode(texelFetch(uTex1, min(q * 2, fs - 1), 0).zw);
+    float wz = exp(-abs(s.a - z) / (z * 0.03 + 0.01));
+    float wn = pow(max(dot(Nc, Nq), 0.0), 12.0);
+    float w = wz * wn;
+    acc += s.rgb * w;
+    wsum += w;
+  }
+  fragColor = vec4(acc / wsum, z);
+}
+`;
+
+export const ssgiApplyFrag = /* glsl */ `
+#include <common>
+#include <ubo_camera>
+#include <depth_util>
+uniform sampler2D uTex0;   // scene colour
+uniform sampler2D uTex1;   // filtered GI (half-res): rgb, a = linear depth
+uniform sampler2D uTex2;   // G-buffer RT2: sqrt(albedo)
+uniform sampler2D uTex3;   // depth (full-res)
+uniform vec4 uGIA;         // x = intensity, y = debug view
+in vec2 vUv;
+layout(location = 0) out vec4 fragColor;
+
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec3 scene = texelFetch(uTex0, ip, 0).rgb;
+  fragColor = vec4(scene, 1.0);
+  float d = texelFetch(uTex3, ip, 0).r;
+  if (d >= 1.0) {
+    if (uGIA.y > 0.5) fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+  float z = linZ(d);
+  ivec2 hs = textureSize(uTex1, 0);
+  vec2 hp = (vec2(ip) + 0.5) * 0.5 - 0.5;
+  ivec2 b = ivec2(floor(hp));
+  vec2 f = hp - vec2(b);
+  vec3 acc = vec3(0.0);
+  float wsum = 0.0;
+  for (int k = 0; k < 4; k++) {
+    ivec2 o = ivec2(k & 1, k >> 1);
+    ivec2 q = clamp(b + o, ivec2(0), hs - 1);
+    vec4 g = texelFetch(uTex1, q, 0);
+    if (g.a <= 0.0) continue;
+    float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+    float w = max(bw, 1e-3) * exp(-abs(g.a - z) / (z * 0.03 + 0.01));
+    acc += g.rgb * w;
+    wsum += w;
+  }
+  vec3 gi = wsum > 1e-5 ? acc / wsum : vec3(0.0);
+  vec3 sa = texelFetch(uTex2, ip, 0).rgb;
+  vec3 albedo = sa * sa;
+  vec3 bounce = albedo * gi * uGIA.x;
+  fragColor = vec4(uGIA.y > 0.5 ? bounce * 2.0 : scene + bounce, 1.0);
+}
+`;

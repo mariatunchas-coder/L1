@@ -96,7 +96,11 @@ export interface Showcase {
   playClip(index: number): void;
   setClipSpeed(s: number): void;
   screenshot(): Promise<Blob>;
-  setCameraPreset(p: 'default' | 'top' | 'front' | 'low' | 'close'): void;
+  setCameraPreset(p: 'default' | 'top' | 'front' | 'low' | 'close' | 'relief' | 'glass' | 'gi'): void;
+  /** Global control of every parallax-mapped demo material (relief depth multiplier, self-shadow, cavity AO, max steps). */
+  setParallax(depthScale: number, selfShadow: number, cavityAO: number, maxSteps: number): void;
+  /** Dispersion strength of the demo glass objects. */
+  setDispersion(d: number): void;
   pickObject(ndcX: number, ndcY: number, focus?: boolean): PickResult | null;
   setInstanceCount(n: number): void;
   resize(w: number, h: number): void;
@@ -156,10 +160,19 @@ export async function createShowcase(
 
   const FLOOR_Y = 0.3;
 
+  // every material that uses parallax occlusion mapping (base relief depth in metres) – driven from the UI
+  const pomMats: { m: PBRMaterial; base: number }[] = [];
+  const pom = (m: PBRMaterial, depth: number): PBRMaterial => {
+    m.parallaxScale = depth;
+    pomMats.push({ m, base: depth });
+    return m;
+  };
+  const glassMats: { m: PBRMaterial; k: number }[] = [];
+
   // ── ground ──
   const ground = new Mesh(
     new PlaneGeometry(5000, 5000),
-    new PBRMaterial({ ...grass, uvRepeat: [750, 750], roughness: 1, name: 'Ground' })
+    new PBRMaterial({ ...grass, heightMap: null, uvRepeat: [750, 750], roughness: 1, name: 'Ground' })
   );
   ground.name = 'Rumput';
   ground.rotation.x = -Math.PI / 2;
@@ -169,7 +182,7 @@ export async function createShowcase(
   // ── marble platform ──
   const platform = new Mesh(
     new RoundedBoxGeometry(34, 0.6, 30, 0.06, 3),
-    new PBRMaterial({ ...marble, uvRepeat: [8.5, 7.5], roughness: 1, name: 'Marmer' })
+    pom(new PBRMaterial({ ...marble, uvRepeat: [8.5, 7.5], roughness: 1, name: 'Marmer' }), 0.018)
   );
   platform.name = 'Panggung marmer';
   platform.position.set(0, 0, 0);
@@ -178,7 +191,7 @@ export async function createShowcase(
   // ── brick wall ──
   const wall = new Mesh(
     new RoundedBoxGeometry(24, 6, 0.9, 0.05, 2),
-    new PBRMaterial({ ...bricks, uvRepeat: [27, 6.8], roughness: 1, normalScale: 1.1, name: 'Bata' })
+    pom(new PBRMaterial({ ...bricks, uvRepeat: [27, 6.8], roughness: 1, normalScale: 1.1, name: 'Bata' }), 0.03)
   );
   wall.name = 'Dinding bata';
   wall.position.set(0, FLOOR_Y + 3, -11);
@@ -213,14 +226,14 @@ export async function createShowcase(
   scene.add(carPaint);
 
   // ── wooden pedestal + brushed copper torus knot ──
-  const woodMat = new PBRMaterial({ ...wood, uvRepeat: [3, 1.2], roughness: 1, clearcoat: 0.6, clearcoatRoughness: 0.2, name: 'Kayu' });
+  const woodMat = pom(new PBRMaterial({ ...wood, uvRepeat: [3, 1.2], roughness: 1, clearcoat: 0.6, clearcoatRoughness: 0.2, name: 'Kayu' }), 0.02);
   const ped1 = new Mesh(new CylinderGeometry(1.9, 2.05, 0.9, 64), woodMat);
   ped1.name = 'Alas kayu';
   ped1.position.set(-7.2, FLOOR_Y + 0.45, -3.2);
   scene.add(ped1);
   const knot = new Mesh(
     new TorusKnotGeometry(0.85, 0.27, 360, 48, 2, 3),
-    new PBRMaterial({ ...brushed, color: lin(0.955, 0.638, 0.538), roughness: 1, metalness: 1, clearcoat: 0.35, clearcoatRoughness: 0.08, name: 'Tembaga' })
+    new PBRMaterial({ ...brushed, heightMap: null, color: lin(0.955, 0.638, 0.538), roughness: 1, metalness: 1, clearcoat: 0.35, clearcoatRoughness: 0.08, name: 'Tembaga' })
   );
   knot.name = 'Torus knot tembaga';
   knot.position.set(-7.2, FLOOR_Y + 0.9 + 1.55, -3.2);
@@ -237,15 +250,16 @@ export async function createShowcase(
   scene.add(inner);
   const glass = new Mesh(
     new SphereGeometry(1.25, 128, 64),
-    new PBRMaterial({ color: lin(0.96, 0.99, 1.0), metalness: 0, roughness: 0.02, transmission: 1, ior: 1.5, thickness: 1.1, attenuationColor: lin(0.86, 0.97, 0.93), attenuationDistance: 7, name: 'Kaca' })
+    new PBRMaterial({ color: lin(0.96, 0.99, 1.0), metalness: 0, roughness: 0.02, transmission: 1, ior: 1.5, thickness: 1.1, attenuationColor: lin(0.86, 0.97, 0.93), attenuationDistance: 7, name: 'Kaca', dispersion: 0.8 })
   );
+  glassMats.push({ m: glass.material as PBRMaterial, k: 0.2 });
   glass.name = 'Bola kaca';
   glass.castShadow = false;
   glass.position.set(7.2, FLOOR_Y + 0.9 + 1.25, -3.2);
   scene.add(glass);
 
   // ── concrete pillars (long cascaded shadows) ──
-  const concreteMat = new PBRMaterial({ ...concrete, uvRepeat: [3, 6], roughness: 1, name: 'Beton' });
+  const concreteMat = pom(new PBRMaterial({ ...concrete, uvRepeat: [3, 6], roughness: 1, name: 'Beton' }), 0.025);
   const pillarGeo = new CylinderGeometry(0.7, 0.7, 11, 48);
   for (const [x, z] of [
     [-14.5, 9],
@@ -376,7 +390,7 @@ export async function createShowcase(
     BD = 5.4,
     RIM = 0.4,
     RH = 1.1;
-  const stone = new PBRMaterial({ ...concrete, uvRepeat: [3, 1], roughness: 1, name: 'Batu kolam' });
+  const stone = pom(new PBRMaterial({ ...concrete, uvRepeat: [3, 1], roughness: 1, name: 'Batu kolam' }), 0.02);
   const rim = (w: number, d: number, x: number, z: number) => {
     const m = new Mesh(new RoundedBoxGeometry(w, RH, d, 0.05, 2), stone);
     m.name = 'Tepi kolam';
@@ -387,7 +401,7 @@ export async function createShowcase(
   rim(BW + 2 * RIM, RIM, BX, BZ + BD / 2 + RIM / 2);
   rim(RIM, BD, BX - BW / 2 - RIM / 2, BZ);
   rim(RIM, BD, BX + BW / 2 + RIM / 2, BZ);
-  const poolFloor = new Mesh(new BoxGeometry(BW, 0.2, BD), new PBRMaterial({ ...marble, uvRepeat: [2, 1.4], color: lin(0.62, 0.7, 0.68), roughness: 1, name: 'Dasar kolam' }));
+  const poolFloor = new Mesh(new BoxGeometry(BW, 0.2, BD), new PBRMaterial({ ...marble, heightMap: null, uvRepeat: [2, 1.4], color: lin(0.62, 0.7, 0.68), roughness: 1, name: 'Dasar kolam' }));
   poolFloor.name = 'Dasar kolam';
   poolFloor.position.set(BX, FLOOR_Y + 0.1, BZ);
   scene.add(poolFloor);
@@ -402,6 +416,58 @@ export async function createShowcase(
   waterMesh.position.set(BX, FLOOR_Y + 0.95, BZ);
   waterMesh.castShadow = false;
   scene.add(waterMesh);
+
+  // ── Lumina 3 showcase: relief panels (parallax occlusion mapping, large scale so the depth reads) ──
+  const slab = (x: number, ry: number, set: typeof bricks, rep: [number, number], depth: number, name: string) => {
+    const m = pom(new PBRMaterial({ ...set, uvRepeat: rep, roughness: 1, name }), depth);
+    const mesh = new Mesh(new BoxGeometry(2.6, 3.2, 0.45), m);
+    mesh.name = name;
+    mesh.position.set(x, FLOOR_Y + 1.6, -7.7);
+    mesh.rotation.y = ry;
+    scene.add(mesh);
+  };
+  slab(-11.3, 0.16, bricks, [1.5, 1.5], 0.07, 'Panel relief · bata');
+  slab(-8.2, -0.1, wood, [1.4, 1.1], 0.045, 'Panel relief · kayu');
+  slab(8.2, 0.1, concrete, [1.2, 1.2], 0.06, 'Panel relief · beton');
+  slab(11.3, -0.16, marble, [1, 1], 0.05, 'Panel relief · ubin marmer');
+
+  // ── dispersive glass: a thin lens in front of the neon ring and a prism ──
+  const lensMat = new PBRMaterial({ color: lin(0.97, 0.99, 1), roughness: 0.01, transmission: 1, ior: 1.52, thickness: 0.7, dispersion: 4, attenuationColor: lin(0.93, 0.98, 0.97), attenuationDistance: 9, name: 'Lensa kaca' });
+  glassMats.push({ m: lensMat, k: 1 });
+  const lens = new Mesh(new SphereGeometry(1.25, 96, 48), lensMat);
+  lens.name = 'Lensa kaca (dispersi)';
+  lens.scale.set(1, 1, 0.38);
+  lens.position.set(0, FLOOR_Y + 5.0, -9.5);
+  lens.castShadow = false;
+  scene.add(lens);
+  const prismMat = new PBRMaterial({ color: lin(0.97, 0.99, 1), roughness: 0.01, transmission: 1, ior: 1.6, thickness: 0.9, dispersion: 6, name: 'Prisma kaca' });
+  glassMats.push({ m: prismMat, k: 1.5 });
+  const prism = new Mesh(new CylinderGeometry(0.9, 0.9, 2.6, 3), prismMat);
+  prism.name = 'Prisma kaca (dispersi)';
+  prism.position.set(4.6, FLOOR_Y + 1.3, -5.6);
+  prism.rotation.y = 0.5;
+  prism.castShadow = false;
+  scene.add(prism);
+
+  // ── colour bleeding corners for screen-space GI (saturated walls next to white objects) ──
+  const white = new PBRMaterial({ color: lin(0.85, 0.85, 0.85), roughness: 0.85, name: 'Putih' });
+  const cornell = (sx: number, color: Color, name: string) => {
+    const wallM = new Mesh(new BoxGeometry(0.25, 4.2, 5.5), new PBRMaterial({ color, roughness: 0.8, name }));
+    wallM.name = name;
+    wallM.position.set(sx * 16.3, FLOOR_Y + 2.1, -3.6);
+    scene.add(wallM);
+    const box = new Mesh(new RoundedBoxGeometry(1.7, 1.7, 1.7, 0.08, 3), white);
+    box.name = 'Kubus putih (GI)';
+    box.position.set(sx * 14.6, FLOOR_Y + 0.85, -3.2);
+    box.rotation.y = 0.5;
+    scene.add(box);
+    const ball = new Mesh(new SphereGeometry(0.8, 48, 24), white);
+    ball.name = 'Bola putih (GI)';
+    ball.position.set(sx * 14.2, FLOOR_Y + 0.8, -0.3);
+    scene.add(ball);
+  };
+  cornell(1, lin(0.8, 0.03, 0.03), 'Dinding merah (GI)');
+  cornell(-1, lin(0.05, 0.25, 0.9), 'Dinding biru (GI)');
 
   // everything except ground / platform / sun can be hidden to give imported models a clean stage
   const props = scene.children.filter((o) => o !== ground && o !== platform && o !== sun);
@@ -527,6 +593,9 @@ export async function createShowcase(
       if (p === 'default') controls.setView(new Vector3(0, 2.0, -0.5), 26, 32, 13);
       else if (p === 'top') controls.setView(t, d * 1.2, 20, 72);
       else if (p === 'front') controls.setView(t, d, 0, 8);
+      else if (p === 'relief') controls.setView(new Vector3(-9.7, 1.9, -7.7), 6.5, -28, 8);
+      else if (p === 'glass') controls.setView(new Vector3(1.5, 4.0, -8), 11, 18, 8);
+      else if (p === 'gi') controls.setView(new Vector3(14, 1.8, -2), 12, -55, 12);
       else if (p === 'low') controls.setView(t, d * 0.8, 40, 2);
       else controls.setView(t, d * 0.45, 50, 14);
       renderer.resetTemporal();
@@ -562,6 +631,18 @@ export async function createShowcase(
       sky.cloudScale = scale;
       sky.touch();
       sun.syncWithSky(sky);
+    },
+    setParallax(depthScale, selfShadow, cavityAO, maxSteps) {
+      for (const { m, base } of pomMats) {
+        m.parallaxScale = base * depthScale;
+        m.parallaxSelfShadow = selfShadow;
+        m.parallaxAO = cavityAO;
+        m.parallaxMaxSteps = maxSteps;
+        m.parallaxMinSteps = Math.max(4, Math.round(maxSteps * 0.25));
+      }
+    },
+    setDispersion(d) {
+      for (const { m, k } of glassMats) m.dispersion = d * k;
     },
     renderOnce() {
       controls.update(0);

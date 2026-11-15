@@ -1,3 +1,34 @@
+# Lumina 3
+
+Lumina 3 adds the three "next-gen" screen-space features of modern game engines on top of Lumina 2.
+
+| Feature | What it does | Switch |
+| --- | --- | --- |
+| **Screen-Space Global Illumination (SSGI)** | Lumen-style diffuse colour bleeding between objects (red wall → white floor, neon → brick). Half-res cosine-weighted rays are marched through the depth buffer and gather the radiance of the lit frame; temporal accumulation (velocity reprojection, depth-based disocclusion rejection, variance clipping) + depth/normal-aware blur + bilateral upsample × G-buffer albedo | `renderer.post.ssgi` |
+| **Parallax Occlusion Mapping (POM)** | True per-pixel relief on bricks, wood, concrete, tiles: height-field ray march with binary refinement, **sun self-shadowing**, cavity AO, normal derived from the height field when no normal map is given, `textureGrad` with the undisplaced gradients (no mip seams), distance fade | `material.heightMap` + `parallaxScale`, `renderer.parallax` |
+| **Screen-Space Refraction + dispersion** | Glass / glTF transmission: the refracted ray leaves the volume and is marched through the **opaque** depth snapshot (parallax-correct), lens `bend`, per-channel RGB refraction (`dispersion`, `KHR_materials_dispersion`), auto-mip anti-aliasing, rejection of objects in front of the glass, environment fallback at screen edges | `material.dispersion`, `renderer.post.refraction` |
+
+Also new: G-buffer albedo attachment (only allocated while SSGI is on), instance colour in the G-buffer, `applyQuality()` presets and the `AdaptiveQuality` ladder know the new effects (SSGI rays/steps, parallax quality, refraction steps, SSGI off), procedural texture sets (`createBricks()`, `createWoodPlanks()`, …) now return a `heightMap`.
+
+```ts
+import { PBRMaterial, createBricks, applyQuality } from './lumina';
+
+renderer.post.ssgi.enabled = true;
+renderer.post.ssgi.intensity = 1.5;            // artistic multiplier (1 = physically scaled)
+renderer.post.refraction.bend = 0.4;           // 0 = flat slab (glTF reference) … 1 = full lens
+
+const brick = new PBRMaterial({ ...createBricks(), uvRepeat: [4, 4], parallaxScale: 0.04 });  // metres of relief
+const glass = new PBRMaterial({ transmission: 1, ior: 1.52, thickness: 0.7, dispersion: 4 });
+renderer.parallax.quality = 0.7;               // scales the ray-march step count
+applyQuality(renderer, 'ultra', sun);
+```
+
+Notes / limits: SSGI and SSR only know what is on screen (off-screen light does not bounce – the IBL still provides it);
+POM does not change silhouettes or the depth buffer; refraction is single-layer (glass does not see other glass);
+`parallaxSelfShadow` applies to the sun only.
+
+---
+
 # Lumina 2
 
 Performance-first, physically based **WebGL2** rendering engine (TypeScript, zero runtime dependencies) – now with
