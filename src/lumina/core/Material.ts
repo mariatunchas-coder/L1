@@ -75,6 +75,23 @@ export interface PBRMaterialParams {
   parallaxMaxSteps?: number;
   parallaxSelfShadow?: number;
   parallaxAO?: number;
+  /** 0 … 1 – how much of the height-field normal is blended (RNM) into the normal map (0 = normal map only). */
+  parallaxNormalBlend?: number;
+  /** Local-light (point / spot) parallax self-shadowing. */
+  parallaxLocalShadow?: boolean;
+
+  // ── Lumina 4: detail maps, surface layers, decals ──
+  detailMap?: Texture | null;
+  detailScale?: number;
+  detailNormalScale?: number;
+  detailRoughness?: number;
+  detailDistance?: number;
+  wetness?: number;
+  dust?: number;
+  dustColor?: number | string | Color;
+  layerScale?: number;
+  receiveDecals?: boolean;
+  layers?: boolean;
 }
 
 /**
@@ -170,6 +187,35 @@ export class PBRMaterial extends Material {
   parallaxSelfShadow = 1;
   /** 0 … 1 – darkens the bottoms of grooves / mortar joints (cavity occlusion from the ray depth). */
   parallaxAO = 0.5;
+  /**
+   * Height-field normal ⊕ normal map (Reoriented Normal Mapping). Procedural sets derive their normal map from the same
+   * height field, so the default 0.5 keeps the combined slope close to the authored one; 0 restores "normal map only".
+   */
+  parallaxNormalBlend = 0.5;
+  /** Parallax self-shadowing toward the nearest point / spot lights (not only the sun). */
+  parallaxLocalShadow = true;
+
+  /**
+   * Detail map (tiling micro texture, see `createDetailMap()`): R,G = tangent normal, B = roughness variation, A = grime mask.
+   * It is repeated `detailScale` times over the base uv and fades out with distance (`detailDistance`, metres).
+   */
+  detailMap: Texture | null = null;
+  detailScale = 14;
+  detailNormalScale = 0.7;
+  /** ± roughness modulation (fingerprints, micro scratches). */
+  detailRoughness = 0.3;
+  detailDistance = 24;
+  /** 0 … 1 – water film: darkens the albedo, lowers roughness, fills cavities first. */
+  wetness = 0;
+  /** 0 … 1 – dust settled on up-facing surfaces (rougher, lighter, matte). */
+  dust = 0;
+  dustColor = new Color(0.55, 0.47, 0.37);
+  /** Spatial frequency (1/m) of the wetness / dust patch noise. */
+  layerScale = 0.8;
+  /** Whether scene decals are projected onto this material. */
+  receiveDecals = true;
+  /** Always compile the wet / dust layer code (so `wetness` / `dust` can be animated from 0 without a shader switch). */
+  layers = false;
 
   constructor(p: PBRMaterialParams = {}) {
     super();
@@ -218,6 +264,19 @@ export class PBRMaterial extends Material {
     if (p.parallaxMaxSteps !== undefined) this.parallaxMaxSteps = p.parallaxMaxSteps;
     if (p.parallaxSelfShadow !== undefined) this.parallaxSelfShadow = p.parallaxSelfShadow;
     if (p.parallaxAO !== undefined) this.parallaxAO = p.parallaxAO;
+    if (p.parallaxNormalBlend !== undefined) this.parallaxNormalBlend = p.parallaxNormalBlend;
+    if (p.parallaxLocalShadow !== undefined) this.parallaxLocalShadow = p.parallaxLocalShadow;
+    if (p.detailMap !== undefined) this.detailMap = p.detailMap;
+    if (p.detailScale !== undefined) this.detailScale = p.detailScale;
+    if (p.detailNormalScale !== undefined) this.detailNormalScale = p.detailNormalScale;
+    if (p.detailRoughness !== undefined) this.detailRoughness = p.detailRoughness;
+    if (p.detailDistance !== undefined) this.detailDistance = p.detailDistance;
+    if (p.wetness !== undefined) this.wetness = p.wetness;
+    if (p.dust !== undefined) this.dust = p.dust;
+    if (p.dustColor !== undefined) this.dustColor.set(p.dustColor as Color);
+    if (p.layerScale !== undefined) this.layerScale = p.layerScale;
+    if (p.receiveDecals !== undefined) this.receiveDecals = p.receiveDecals;
+    if (p.layers !== undefined) this.layers = p.layers;
   }
 
   /** True when the material refracts the scene behind it (drawn after the opaque pass). */

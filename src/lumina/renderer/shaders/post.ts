@@ -204,6 +204,82 @@ void main() {
 }
 `;
 
+/**
+ * Luminance histogram (64 bins in EV space). A grid of points – one per sample – scatters a centre-weighted count into
+ * its bin with additive blending (no compute shaders in WebGL2).
+ */
+export const histVert = /* glsl */ `
+uniform sampler2D uTex0;
+uniform vec4 uHist;       // x = grid size, y = min EV, z = max EV, w = centre-weight strength
+uniform vec2 uStepUv;     // size of one grid cell in uv
+out float vWeight;
+void main() {
+  int N = int(uHist.x);
+  int ix = gl_VertexID % N;
+  int iy = gl_VertexID / N;
+  vec2 uv = (vec2(float(ix), float(iy)) + 0.5) / float(N);
+  vec3 c = vec3(0.0);
+  for (int k = 0; k < 4; k++) {
+    vec2 o = (vec2(float(k & 1), float(k >> 1)) - 0.5) * 0.5 * uStepUv;
+    c += min(textureLod(uTex0, uv + o, 0.0).rgb, vec3(60000.0));
+  }
+  c *= 0.25;
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  vec2 d = uv - 0.5;
+  float r2 = dot(d, d) * 4.0;                              // 0 centre … 2 corner
+  float w = mix(1.0, exp(-r2 * 2.2), uHist.w);             // centre-weighted metering
+  float ev = log2(max(l, 1e-6));
+  float bin = clamp((ev - uHist.y) / (uHist.z - uHist.y), 0.0, 0.9999);
+  vWeight = w * 0.2;
+  bool bad = !(l >= 0.0) || l > 1e9;                        // NaN / inf never enter the histogram
+  float x = (floor(bin * 64.0) + 0.5) / 64.0 * 2.0 - 1.0;
+  gl_Position = bad ? vec4(2.0, 2.0, 2.0, 1.0) : vec4(x, 0.0, 0.0, 1.0);
+  gl_PointSize = 1.0;
+}
+`;
+
+export const histFrag = /* glsl */ `
+in float vWeight;
+layout(location = 0) out vec4 fragColor;
+void main() { fragColor = vec4(vWeight, 0.0, 0.0, 0.0); }
+`;
+
+/** Reads the histogram, averages only the part between two percentiles (ignores specular sparks and black voids). */
+export const histAdaptFrag = /* glsl */ `
+uniform sampler2D uTex0;   // histogram: 64 × 1, R = weighted count
+uniform sampler2D uTex1;   // previous adapted luminance
+uniform float uDt;
+uniform float uSpeedUp;
+uniform float uSpeedDown;
+uniform float uFirst;
+uniform vec4 uHistP;       // x = min EV, y = max EV, z = low percentile, w = high percentile
+in vec2 vUv;
+out vec4 fragColor;
+void main() {
+  float prev = texture(uTex1, vec2(0.5)).r;
+  float total = 0.0;
+  for (int i = 0; i < 64; i++) total += texelFetch(uTex0, ivec2(i, 0), 0).r;
+  float cur = prev;
+  if (total > 1e-4) {
+    float lo = total * uHistP.z;
+    float hi = total * uHistP.w;
+    float cum = 0.0, sw = 0.0, sev = 0.0;
+    for (int i = 0; i < 64; i++) {
+      float c = texelFetch(uTex0, ivec2(i, 0), 0).r;
+      float w = max(0.0, min(cum + c, hi) - max(cum, lo));
+      float ev = uHistP.x + (float(i) + 0.5) / 64.0 * (uHistP.y - uHistP.x);
+      sev += w * ev;
+      sw += w;
+      cum += c;
+    }
+    cur = exp2(sw > 1e-6 ? sev / sw : uHistP.x);
+  } else if (uFirst > 0.5) cur = 0.18;
+  float speed = cur > prev ? uSpeedUp : uSpeedDown;
+  float k = uFirst > 0.5 ? 1.0 : 1.0 - exp(-uDt * speed);
+  fragColor = vec4(prev + (cur - prev) * k, 0.0, 0.0, 1.0);
+}
+`;
+
 export const compositeFrag = /* glsl */ `
 #include <common>
 uniform sampler2D uTex0;   // HDR scene
@@ -212,6 +288,7 @@ uniform sampler2D uTex2;   // adapted luminance
 uniform sampler2D uTex3;   // volumetric fog: rgb in-scatter, a transmittance
 uniform sampler2D uTex4;   // lens flare
 uniform vec4 uParams5;     // x flare intensity, y lens distortion, z grade enabled
+uniform vec4 uParams6;     // x optical (cos^4) vignette, y energy-conserving bloom, z exposure compensation (EV)
 uniform vec3 uSlope;       // ASC CDL (applied in display space)
 uniform vec3 uOffset;
 uniform vec3 uPower;
@@ -321,7 +398,8 @@ void main() {
     col = max(col + dlt * uParams4.x, 0.0);
   }
 
-  col += texture(uTex1, uv).rgb * uParams0.y;
+  if (uParams6.y > 0.5) col = mix(col, texture(uTex1, uv).rgb, clamp(uParams0.y, 0.0, 1.0));   // energy-conserving (physical) bloom
+  else col += texture(uTex1, uv).rgb * uParams0.y;
   if (uParams5.x > 0.0) col += texture(uTex4, uv).rgb * uParams5.x;
   col *= vec3(1.0 + 0.22 * uParams4.y, 1.0 + 0.02 * uParams4.y, 1.0 - 0.22 * uParams4.y);
 
@@ -330,10 +408,17 @@ void main() {
     float lum = clamp(texture(uTex2, vec2(0.5)).r, uParams2.z, uParams2.w);
     exposure *= uParams2.y / lum;
   }
+  exposure *= exp2(uParams6.z);
   col *= exposure;
 
   float vig = smoothstep(0.95, 0.25, length(dir * vec2(uParams3.y, 1.0)) * 1.25);
   col *= mix(1.0, vig, uParams0.z);
+  if (uParams6.x > 0.0) {
+    // natural (cos^4) light fall-off of a real lens: cos^2(theta) = 1 / (1 + tan^2(theta))
+    vec2 q = dir * vec2(uParams3.y, 1.0) * 0.8;
+    float c2 = 1.0 / (1.0 + dot(q, q));
+    col *= mix(1.0, c2 * c2, uParams6.x);
+  }
 
   int tm = int(uParams1.w + 0.5);
   if (tm == 1) col = reinhard(col);

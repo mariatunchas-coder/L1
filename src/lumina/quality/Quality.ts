@@ -1,5 +1,6 @@
 import type { DirectionalLight } from '../core/Lights';
 import type { Renderer } from '../renderer/Renderer';
+import type { DeviceProfile } from './Device';
 
 export type QualityLevel = 'low' | 'medium' | 'high' | 'ultra' | 'photo';
 
@@ -38,6 +39,8 @@ export function applyQuality(renderer: Renderer, level: QualityLevel, sun?: Dire
     ssrSteps: number;
     fogSteps: number;
     dofTaps: number;
+    local: number;
+    cache: number;
   }) => {
     renderer.setSamples(o.msaa);
     p.taa.enabled = o.taa;
@@ -56,6 +59,12 @@ export function applyQuality(renderer: Renderer, level: QualityLevel, sun?: Dire
     p.lensFlare.enabled = o.flare;
     p.dof.taps = o.dofTaps;
     p.sharpen = o.sharpen;
+    renderer.localShadows.enabled = o.local > 0;
+    if (o.local > 0) renderer.localShadows.mapSize = o.local;
+    p.volumetricFog.localLights = o.local > 0;
+    p.ssgi.worldCache = o.cache > 0;
+    if (o.cache > 0) p.ssgi.worldCacheResolution = o.cache;
+    p.ssgi.multiBounce = o.cache > 0 || o.ssgi;
     renderer.dynamicResolution.enabled = false;
     renderer.renderScale = o.scale;
     if (sun) {
@@ -65,16 +74,39 @@ export function applyQuality(renderer: Renderer, level: QualityLevel, sun?: Dire
   };
   switch (level) {
     case 'low':
-      return set({ msaa: 0, taa: false, ssao: false, ssr: false, ssgi: false, ssgiRays: 1, ssgiSteps: 10, refrSteps: 12, pom: 0.5, contact: false, fog: false, mb: false, flare: false, shadow: 1024, cascades: 2, scale: 0.75, sharpen: 0, ssrSteps: 32, fogSteps: 12, dofTaps: 16 });
+      return set({ msaa: 0, taa: false, ssao: false, ssr: false, ssgi: false, ssgiRays: 1, ssgiSteps: 10, refrSteps: 12, pom: 0.5, contact: false, fog: false, mb: false, flare: false, shadow: 1024, cascades: 2, scale: 0.75, sharpen: 0, ssrSteps: 32, fogSteps: 12, dofTaps: 16, local: 0, cache: 0 });
     case 'medium':
-      return set({ msaa: 2, taa: false, ssao: true, ssr: false, ssgi: false, ssgiRays: 1, ssgiSteps: 12, refrSteps: 16, pom: 0.7, contact: false, fog: false, mb: false, flare: false, shadow: 2048, cascades: 3, scale: 1, sharpen: 0, ssrSteps: 48, fogSteps: 16, dofTaps: 24 });
+      return set({ msaa: 2, taa: false, ssao: true, ssr: false, ssgi: false, ssgiRays: 1, ssgiSteps: 12, refrSteps: 16, pom: 0.7, contact: false, fog: false, mb: false, flare: false, shadow: 2048, cascades: 3, scale: 1, sharpen: 0, ssrSteps: 48, fogSteps: 16, dofTaps: 24, local: 512, cache: 0 });
     case 'high':
-      return set({ msaa: 0, taa: true, ssao: true, ssr: true, ssgi: false, ssgiRays: 1, ssgiSteps: 14, refrSteps: 24, pom: 1, contact: true, fog: false, mb: false, flare: false, shadow: 2048, cascades: 3, scale: 1, sharpen: 0.25, ssrSteps: 64, fogSteps: 24, dofTaps: 28 });
+      return set({ msaa: 0, taa: true, ssao: true, ssr: true, ssgi: false, ssgiRays: 1, ssgiSteps: 14, refrSteps: 24, pom: 1, contact: true, fog: false, mb: false, flare: false, shadow: 2048, cascades: 3, scale: 1, sharpen: 0.25, ssrSteps: 64, fogSteps: 24, dofTaps: 28, local: 1024, cache: 0 });
     case 'ultra':
-      return set({ msaa: 0, taa: true, ssao: true, ssr: true, ssgi: true, ssgiRays: 1, ssgiSteps: 16, refrSteps: 28, pom: 1, contact: true, fog: true, mb: true, flare: false, shadow: 4096, cascades: 4, scale: 1, sharpen: 0.25, ssrSteps: 96, fogSteps: 32, dofTaps: 40 });
+      return set({ msaa: 0, taa: true, ssao: true, ssr: true, ssgi: true, ssgiRays: 1, ssgiSteps: 16, refrSteps: 28, pom: 1, contact: true, fog: true, mb: true, flare: false, shadow: 4096, cascades: 4, scale: 1, sharpen: 0.25, ssrSteps: 96, fogSteps: 32, dofTaps: 40, local: 1024, cache: 32 });
     case 'photo':
-      return set({ msaa: 0, taa: true, ssao: true, ssr: true, ssgi: true, ssgiRays: 2, ssgiSteps: 24, refrSteps: 40, pom: 1, contact: true, fog: true, mb: false, flare: true, shadow: 4096, cascades: 4, scale: 1, sharpen: 0.3, ssrSteps: 128, fogSteps: 48, dofTaps: 56 });
+      return set({ msaa: 0, taa: true, ssao: true, ssr: true, ssgi: true, ssgiRays: 2, ssgiSteps: 24, refrSteps: 40, pom: 1, contact: true, fog: true, mb: false, flare: true, shadow: 4096, cascades: 4, scale: 1, sharpen: 0.3, ssrSteps: 128, fogSteps: 48, dofTaps: 56, local: 2048, cache: 48 });
   }
+}
+
+/**
+ * Picks a preset from the detected hardware (`renderer.device`): phones and weak GPUs get a lower preset, MSAA off / 2×,
+ * fewer parallax / refraction steps and the dynamic-resolution governor; desktop GPUs keep the full pipeline.
+ * Call it once right after creating the renderer (and before building heavy geometry – see `device.geometryDetail`).
+ */
+export function applyDeviceQuality(renderer: Renderer, sun?: DirectionalLight | null): DeviceProfile {
+  const d = renderer.device;
+  applyQuality(renderer, d.preset, sun);
+  if (d.tier !== 'high') {
+    renderer.parallax.quality = d.tier === 'low' ? 0.35 : 0.6;
+    renderer.post.refraction.steps = d.tier === 'low' ? 8 : 14;
+    renderer.post.bloom.enabled = true;
+    renderer.post.dof.taps = 14;
+    renderer.post.volumetricFog.steps = 12;
+    renderer.post.autoExposureMode = 'histogram';
+    renderer.environmentUpdateInterval = 250;
+    if (sun) sun.shadow.cascades = Math.min(sun.shadow.cascades, 2);
+    renderer.dynamicResolution = { enabled: true, targetFps: d.tier === 'low' ? 40 : 50, minScale: d.tier === 'low' ? 0.45 : 0.6, maxScale: d.tier === 'low' ? 0.8 : 1 };
+    renderer.renderScale = Math.min(renderer.renderScale, d.tier === 'low' ? 0.7 : 0.9);
+  }
+  return d;
 }
 
 interface Step {
@@ -110,6 +142,8 @@ export class AdaptiveQuality {
       return () => (r.renderScale = old);
     };
     this.steps = [
+      { name: 'GI world cache', degrade: (r) => { const o = r.post.ssgi.worldCache; r.post.ssgi.worldCache = false; return () => (r.post.ssgi.worldCache = o); } },
+      { name: 'local light shadows', degrade: (r) => { const o = r.localShadows.enabled; r.localShadows.enabled = false; return () => (r.localShadows.enabled = o); } },
       { name: 'SSGI rays', degrade: (r) => { const o = r.post.ssgi.rays; const st = r.post.ssgi.steps; r.post.ssgi.rays = 1; r.post.ssgi.steps = Math.min(st, 10); return () => { r.post.ssgi.rays = o; r.post.ssgi.steps = st; }; } },
       { name: 'parallax quality', degrade: (r) => { const o = r.parallax.quality; r.parallax.quality = Math.min(o, 0.55); return () => (r.parallax.quality = o); } },
       { name: 'refraction steps', degrade: (r) => { const o = r.post.refraction.steps; r.post.refraction.steps = Math.min(o, 12); return () => (r.post.refraction.steps = o); } },

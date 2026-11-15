@@ -6,6 +6,7 @@
 export const TEX_2D = 0;
 export const TEX_CUBE = 1;
 export const TEX_2D_ARRAY = 2;
+export const TEX_3D = 3;
 export const SCRATCH_UNIT = 15;
 
 export class GLState {
@@ -31,8 +32,8 @@ export class GLState {
 
   constructor(public readonly gl: WebGL2RenderingContext) {
     this.depthFunc = gl.LEQUAL;
-    this.targets = [gl.TEXTURE_2D, gl.TEXTURE_CUBE_MAP, gl.TEXTURE_2D_ARRAY];
-    for (let i = 0; i < 16; i++) this.units.push([null, null, null]);
+    this.targets = [gl.TEXTURE_2D, gl.TEXTURE_CUBE_MAP, gl.TEXTURE_2D_ARRAY, gl.TEXTURE_3D];
+    for (let i = 0; i < 16; i++) this.units.push([null, null, null, null]);
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LEQUAL);
     gl.depthMask(true);
@@ -149,6 +150,6 @@ export class GLState {
   }
   /** Forget a deleted texture so a recycled id can't produce a stale cache hit. */
   forgetTexture(tex: WebGLTexture): void {
-    for (const slot of this.units) for (let k = 0; k < 3; k++) if (slot[k] === tex) slot[k] = null;
+    for (const slot of this.units) for (let k = 0; k < 4; k++) if (slot[k] === tex) slot[k] = null;
   }
 }

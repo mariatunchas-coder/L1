@@ -111,6 +111,20 @@ uniform vec4 uPOM2;          // x = self shadow, y = cavity AO, z = quality scal
 #ifdef USE_CONTACT
 uniform vec4 uContact;       // x = ray length (m), y = thickness (m), z = strength
 #endif
+#ifdef USE_HEIGHT
+uniform vec2 uPOM3;          // x = height-normal ⊕ normal-map blend, y = local-light parallax self shadow (0 / 1)
+#endif
+#ifdef USE_DETAIL
+uniform sampler2D uDetailMap;
+uniform vec4 uDetail;        // x = tiling, y = normal strength, z = roughness amount, w = fade-out distance (m)
+#endif
+#ifdef USE_LAYERS
+uniform vec4 uLayers;        // x = wetness, y = dust, z = patch noise frequency (1/m)
+uniform vec3 uDustColor;
+#endif
+#ifdef USE_DECALS
+uniform sampler2DArray uDecalTex;
+#endif
 
 uniform samplerCube uIrradiance;
 uniform samplerCube uPrefilter;
@@ -121,6 +135,12 @@ uniform sampler2D uOrmMap;
 uniform sampler2D uEmissiveMap;
 #ifdef USE_SHADOWS
 uniform sampler2DArrayShadow uShadowMap;
+#endif
+#ifdef USE_PCSS
+uniform sampler2DArray uShadowRaw;   // same depth array, sampled without comparison (blocker search)
+#endif
+#ifdef USE_LOCAL_SHADOWS
+#include <local_shadow>
 #endif
 #ifdef USE_SSAO
 uniform sampler2D uAoTex;
@@ -167,14 +187,37 @@ float sampleCascade(int c, vec3 wp, vec3 N, float NoL, float noise) {
   float slope = min(sinT / max(sqrt(1.0 - sinT * sinT), 0.15), 6.0);
   float bias = uShadowParams.x * invRange + uShadowParams.z * texel * invRange * slope * 0.7;
   float ref = uvz.z - bias;
-  float radius = uShadowParams.z * uShadowParams.w;
+  float radiusTexels = uShadowParams.z;
+#ifdef USE_PCSS
+  if (uExtra.x > 0.5) {
+    // Percentage-closer soft shadows. 1) blocker search: average depth of everything in front of the receiver
+    float searchR = 14.0 * uShadowParams.w;
+    float blockSum = 0.0;
+    float blockN = 0.0;
+    for (int i = 0; i < 12; i++) {
+      vec2 o = vogelDisk(i, 12, noise) * searchR;
+      float d = texture(uShadowRaw, vec3(uvz.xy + o, float(c))).r;
+      if (d < ref) {
+        blockSum += d;
+        blockN += 1.0;
+      }
+    }
+    if (blockN < 0.5) return 1.0;   // nothing shadows this point (also skips the PCF taps)
+    // 2. penumbra width ∝ distance between blocker and receiver: razor sharp where an object touches the ground
+    float dBlock = (ref - blockSum / blockN) / max(invRange, 1e-6);   // metres
+    radiusTexels = clamp(dBlock * uExtra.y / texel, radiusTexels, 16.0);
+  }
+#endif
+  float radius = radiusTexels * uShadowParams.w;
+  int taps = radiusTexels > 7.0 ? 24 : SHADOW_TAPS;
   float sum = 0.0;
-  for (int i = 0; i < SHADOW_TAPS; i++) {
-    vec2 o = vogelDisk(i, SHADOW_TAPS, noise) * radius;
+  for (int i = 0; i < 24; i++) {
+    if (i >= taps) break;
+    vec2 o = vogelDisk(i, taps, noise) * radius;
     // hardware 2x2 bilinear PCF on every tap → very smooth penumbra
     sum += texture(uShadowMap, vec4(uvz.xy + o, float(c), ref));
   }
-  return sum / float(SHADOW_TAPS);
+  return sum / float(taps);
 }
 
 float getShadow(vec3 wp, vec3 N, float NoL) {
@@ -240,12 +283,15 @@ struct Surface {
   float ab;
   vec3 sssColor;
   float sssWrap;
+  float microAO;    // material cavity occlusion → micro shadowing of direct light
 };
 
 // Evaluates one punctual/directional light. Returns radiance split in diffuse / specular.
 void evalLight(Surface s, vec3 L, vec3 radiance, inout vec3 diffuse, inout vec3 specular) {
   float rawNoL = dot(s.N, L);
   float NoL = saturate(rawNoL);
+  // micro-shadowing (Jimenez 2016): pores / mortar joints / cracks shadow the grazing light that the normal alone lets through
+  radiance *= mix(1.0, saturate(NoL + 2.0 * s.microAO * s.microAO - 1.0), uExtra.z);
 #ifdef USE_SSS
   if (rawNoL + s.sssWrap <= 0.0) return;
 #else
@@ -383,6 +429,88 @@ vec2 pomWorldToUv(vec3 s, vec3 Ng, vec3 dPdu, vec3 dPdv) {
   du = abs(du) > 1e-12 ? du : 1e-12;
   dv = abs(dv) > 1e-12 ? dv : 1e-12;
   return vec2(dot(s, cu) / du, dot(s, cv) / dv);
+}
+// Height-field ray march from the displaced point toward a light (sun or local light); 1 = lit, 0 = in shadow.
+float pomShadowRay(vec3 Ls, vec3 Ng, vec3 dPdu, vec3 dPdv, vec2 uvD, float tHit, float amount, vec2 dx, vec2 dy) {
+  float NoLg = dot(Ls, Ng);
+  if (NoLg < 0.03) return 1.0;
+  vec3 sL = (Ls - Ng * NoLg) / max(NoLg, 0.1);
+  vec2 duvL = pomWorldToUv(sL, Ng, dPdu, dPdv);
+  float sh = 1.0;
+  for (int k = 1; k <= 12; k++) {
+    float f = float(k) / 12.0;
+    float tau = tHit * f;
+    float blocked = (tHit - tau) - pomSurfaceDepth(uvD + duvL * tau, dx, dy, amount) - amount * 0.012;
+    if (blocked > 0.0) sh = min(sh, 1.0 - saturate(blocked / (amount * 0.12)) * (1.0 - 0.5 * f));
+  }
+  return sh;
+}
+#endif
+
+#ifdef USE_LAYERS
+float lHash(vec3 p) {
+  p = fract(p * 0.3183099 + 0.1);
+  p *= 17.0;
+  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+float lNoise(vec3 x) {
+  vec3 i = floor(x);
+  vec3 f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(lHash(i), lHash(i + vec3(1, 0, 0)), f.x), mix(lHash(i + vec3(0, 1, 0)), lHash(i + vec3(1, 1, 0)), f.x), f.y),
+             mix(mix(lHash(i + vec3(0, 0, 1)), lHash(i + vec3(1, 0, 1)), f.x), mix(lHash(i + vec3(0, 1, 1)), lHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+float lFbm(vec3 p) { return lNoise(p) * 0.5 + lNoise(p * 2.03) * 0.3 + lNoise(p * 4.1) * 0.2; }
+#endif
+
+#if defined(USE_NORMALMAP) || defined(USE_HEIGHT) || defined(USE_DETAIL)
+// Reoriented Normal Mapping (Barré-Brisebois & Hill): adds the detail normal 'u' on top of the base normal 't'
+// (both tangent space, unit length) without flattening either – unlike a plain average or UDN blend.
+vec3 rnmBlend(vec3 t, vec3 u) {
+  t += vec3(0.0, 0.0, 1.0);
+  u *= vec3(-1.0, -1.0, 1.0);
+  return normalize(t * (dot(t, u) / t.z) - u);
+}
+#endif
+
+#ifdef USE_DECALS
+// Projected decals evaluated inside the material: they change albedo, roughness and normal of whatever they cover,
+// so they receive every light, shadow, reflection and fog exactly like the surface underneath.
+void applyDecals(inout vec3 albedo, inout float roughness, inout float metalness, inout vec3 N, vec3 Ng, vec3 wp) {
+  int cnt = int(uDecalInfo.x);
+  for (int i = 0; i < MAX_DECALS; i++) {
+    if (i >= cnt) break;
+    vec3 lp = (uDecals[i].inv * vec4(wp, 1.0)).xyz;
+    vec2 gx = dFdx(lp.xy);      // derivatives are taken before any divergent 'continue'
+    vec2 gy = dFdy(lp.xy);
+    vec3 a = abs(lp);
+    if (a.x > 0.5 || a.y > 0.5 || a.z > 0.5) continue;
+    float facing = smoothstep(0.1, 0.5, dot(Ng, uDecals[i].p2.xyz));
+    if (facing <= 0.0) continue;
+    vec2 duv = lp.xy + 0.5;
+    float layer = uDecals[i].p1.x;
+    vec3 tex = textureGrad(uDecalTex, vec3(duv, layer), gx, gy).rgb;
+    float edge = 1.0 - smoothstep(0.4, 0.5, max(a.x, a.y));
+    float mask = tex.r * uDecals[i].color.a * facing * (1.0 - smoothstep(0.3, 0.5, a.z)) * edge;
+    if (mask <= 0.001) continue;
+    // relief: gradient of the height channel mapped back to world space
+    const float e = 1.0 / 256.0;
+    float hL = textureGrad(uDecalTex, vec3(duv - vec2(e, 0.0), layer), gx, gy).g;
+    float hR = textureGrad(uDecalTex, vec3(duv + vec2(e, 0.0), layer), gx, gy).g;
+    float hD = textureGrad(uDecalTex, vec3(duv - vec2(0.0, e), layer), gx, gy).g;
+    float hU = textureGrad(uDecalTex, vec3(duv + vec2(0.0, e), layer), gx, gy).g;
+    vec2 gUv = vec2(hR - hL, hU - hD) / (2.0 * e);
+    mat4 m = uDecals[i].inv;
+    vec3 gW = gUv.x * vec3(m[0].x, m[1].x, m[2].x) + gUv.y * vec3(m[0].y, m[1].y, m[2].y);
+    gW -= Ng * dot(gW, Ng);
+    N = normalize(N - gW * (0.02 * uDecals[i].p1.z * mask));
+    N = normalize(mix(N, Ng, mask * uDecals[i].p1.w));
+    vec3 tint = uDecals[i].color.rgb * (0.65 + 0.7 * tex.b);
+    albedo = mix(albedo, tint, mask);
+    if (uDecals[i].p1.y >= 0.0) roughness = mix(roughness, uDecals[i].p1.y, mask);
+    roughness = mix(roughness, roughness * 0.45, mask * uDecals[i].p2.w * 0.5);
+    metalness *= 1.0 - mask;
+  }
 }
 #endif
 
@@ -577,6 +705,12 @@ void main() {
   float pomShadow = 1.0;
   float pomMetersU = 1.0;   // world metres per uv unit (used to derive normals from the height field)
   float pomMetersV = 1.0;
+  bool pomActive = false;   // the ray march ran → local lights may self-shadow the relief too
+  vec3 pomDPdu = vec3(1.0, 0.0, 0.0);
+  vec3 pomDPdv = vec3(0.0, 0.0, 1.0);
+  float pomTHit = 0.0;
+  float pomAmount = 0.0;
+  float pomFadeK = 0.0;
 #ifdef USE_HEIGHT
   {
     float camDist = length(uCamPos.xyz - vWorldPos);
@@ -617,23 +751,17 @@ void main() {
         }
         uv += duvDepth * tHit;
         pomDepth01 = saturate(tHit / amount);
+        pomActive = tHit > 1e-5;
+        pomDPdu = dPdu;
+        pomDPdv = dPdv;
+        pomTHit = tHit;
+        pomAmount = amount;
+        pomFadeK = fade;
 
         // self shadowing: height-field ray march from the displaced point toward the sun
         if (uPOM2.x > 0.001 && tHit > 1e-5) {
-          vec3 Ls = uSunDir.xyz;
-          float NoLg = dot(Ls, Ng);
-          if (NoLg > 0.03) {
-            vec3 sL = (Ls - Ng * NoLg) / max(NoLg, 0.1);
-            vec2 duvL = pomWorldToUv(sL, Ng, dPdu, dPdv);
-            float sh = 1.0;
-            for (int k = 1; k <= 12; k++) {
-              float f = float(k) / 12.0;
-              float tau = tHit * f;
-              float blocked = (tHit - tau) - pomSurfaceDepth(uv + duvL * tau, uvDx, uvDy, amount) - amount * 0.012;
-              if (blocked > 0.0) sh = min(sh, 1.0 - saturate(blocked / (amount * 0.12)) * (1.0 - 0.5 * f));
-            }
-            pomShadow = mix(1.0, sh, uPOM2.x * fade);
-          }
+          float sh = pomShadowRay(uSunDir.xyz, Ng, dPdu, dPdv, uv, tHit, amount, uvDx, uvDy);
+          pomShadow = mix(1.0, sh, uPOM2.x * fade);
         }
       }
     }
@@ -674,7 +802,7 @@ void main() {
     N = normalize(Ng + vec3(-wg.x, 0.0, -wg.y));
   }
 #endif
-#if defined(USE_NORMALMAP) || defined(USE_ANISO) || defined(USE_HEIGHT)
+#if defined(USE_NORMALMAP) || defined(USE_ANISO) || defined(USE_HEIGHT) || defined(USE_DETAIL)
   vec3 Tg;
   vec3 Bg;
   #ifdef USE_TANGENT
@@ -692,22 +820,83 @@ void main() {
     Bg = B0 * invmax;
   #endif
 #endif
-#ifdef USE_NORMALMAP
-  vec3 tn = TEX(uNormalMap, uv).xyz * 2.0 - 1.0;
-  tn.xy *= uNormalScale;
-  N = normalize(mat3(Tg, Bg, Ng) * tn);
-#elif defined(USE_HEIGHT)
+#if defined(USE_NORMALMAP) || defined(USE_HEIGHT) || defined(USE_DETAIL)
   {
-    // no normal map: derive the shading normal from the height field (central differences, metric slope)
-    vec2 ts = 1.0 / vec2(textureSize(uHeightMap, 0));
-    float hL = textureGrad(uHeightMap, uv - vec2(ts.x, 0.0), uvDx, uvDy).r;
-    float hR = textureGrad(uHeightMap, uv + vec2(ts.x, 0.0), uvDx, uvDy).r;
-    float hD = textureGrad(uHeightMap, uv - vec2(0.0, ts.y), uvDx, uvDy).r;
-    float hU = textureGrad(uHeightMap, uv + vec2(0.0, ts.y), uvDx, uvDy).r;
-    float gx = (hR - hL) * uPOM.x / (2.0 * ts.x * pomMetersU);
-    float gy = (hU - hD) * uPOM.x / (2.0 * ts.y * pomMetersV);
-    N = normalize(mat3(Tg, Bg, Ng) * normalize(vec3(-gx * uNormalScale, -gy * uNormalScale, 1.0)));
+    vec3 tn = vec3(0.0, 0.0, 1.0);   // tangent-space shading normal
+  #ifdef USE_HEIGHT
+    {
+      // macro relief: normal derived from the height field (central differences, metric slope)
+      vec2 ts = 1.0 / vec2(textureSize(uHeightMap, 0));
+      float hL = textureGrad(uHeightMap, uv - vec2(ts.x, 0.0), uvDx, uvDy).r;
+      float hR = textureGrad(uHeightMap, uv + vec2(ts.x, 0.0), uvDx, uvDy).r;
+      float hD = textureGrad(uHeightMap, uv - vec2(0.0, ts.y), uvDx, uvDy).r;
+      float hU = textureGrad(uHeightMap, uv + vec2(0.0, ts.y), uvDx, uvDy).r;
+      float gx = (hR - hL) * uPOM.x / (2.0 * ts.x * pomMetersU);
+      float gy = (hU - hD) * uPOM.x / (2.0 * ts.y * pomMetersV);
+      #ifdef USE_NORMALMAP
+      float hs = uPOM3.x;                // a normal map exists → the height normal only adds the macro shape
+      #else
+      float hs = uNormalScale;
+      #endif
+      tn = normalize(vec3(-gx * hs, -gy * hs, 1.0));
+    }
+  #endif
+  #ifdef USE_NORMALMAP
+    {
+      // micro detail (pores, grain) from the normal map; combined with the height normal by RNM instead of being ignored
+      vec3 tm = TEX(uNormalMap, uv).xyz * 2.0 - 1.0;
+      tm.xy *= uNormalScale;
+      tm = dot(tm, tm) > 1e-8 ? normalize(tm) : vec3(0.0, 0.0, 1.0);
+      #ifdef USE_HEIGHT
+      tn = uPOM3.x > 0.001 ? rnmBlend(tn, tm) : tm;
+      #else
+      tn = tm;
+      #endif
+    }
+  #endif
+  #ifdef USE_DETAIL
+    {
+      // detail map: a tiny texture repeated dozens of times – only visible (and only sampled) when the camera is close
+      float dFade = 1.0 - smoothstep(uDetail.w * 0.35, uDetail.w, length(uCamPos.xyz - vWorldPos));
+      if (dFade > 0.001) {
+        vec2 duv = uv * uDetail.x;
+        #ifdef USE_HEIGHT
+        vec4 dt = textureGrad(uDetailMap, duv, uvDx * uDetail.x, uvDy * uDetail.x);
+        #else
+        vec4 dt = texture(uDetailMap, duv);
+        #endif
+        vec3 dn = vec3((dt.xy * 2.0 - 1.0) * (uDetail.y * dFade), 0.0);
+        dn.z = sqrt(max(1.0 - dot(dn.xy, dn.xy), 0.05));
+        tn = rnmBlend(tn, normalize(dn));
+        roughness = clamp(roughness + (dt.b - 0.5) * 2.0 * uDetail.z * dFade, 0.045, 1.0);
+        base.rgb *= mix(1.0 - 0.2 * dFade, 1.0, dt.a);          // grime breaks up the flat albedo
+      }
+    }
+  #endif
+    N = normalize(mat3(Tg, Bg, Ng) * tn);
   }
+#endif
+
+#ifdef USE_LAYERS
+  {
+    // Substrate-like surface layers: dust settles on up-facing surfaces, water fills the low spots first
+    float pn = lFbm(vWorldPos * uLayers.z);
+    float dustAmt = saturate(uLayers.y * smoothstep(0.35, 0.95, Ng.y) * smoothstep(0.2, 0.7, pn + uLayers.y * 0.4 - 0.15 + 0.35 * pomDepth01));
+    base.rgb = mix(base.rgb, uDustColor, dustAmt * 0.85);
+    roughness = mix(roughness, max(roughness, 0.92), dustAmt);
+    metalness *= 1.0 - dustAmt;
+    float wl = uLayers.x;
+    float wetMask = saturate(wl * 1.3 + (pn - 0.5) * 0.9 * smoothstep(0.0, 0.25, wl) + pomDepth01 * 0.5 * wl);
+    wetMask *= 1.0 - dustAmt * 0.5;
+    base.rgb = mix(base.rgb, pow(max(base.rgb, vec3(0.0)), vec3(1.75)), wetMask * (1.0 - metalness));   // wet dielectrics are darker + more saturated
+    roughness = mix(roughness, 0.05 + 0.12 * roughness, wetMask);                                          // water film
+    N = normalize(mix(N, Ng, wetMask * wetMask * 0.7));                                                     // water fills the micro relief
+  }
+#endif
+#ifdef USE_DECALS
+  applyDecals(base.rgb, roughness, metalness, N, Ng, vWorldPos);
+  roughness = clamp(roughness, 0.045, 1.0);
+  metalness = saturate(metalness);
 #endif
 
   // ── specular anti-aliasing (Tokuyoshi & Kaplanyan) – removes shimmering on bumpy / distant surfaces ──
@@ -744,6 +933,7 @@ void main() {
   s.ab = s.a;
   s.sssColor = vec3(0.0);
   s.sssWrap = 0.0;
+  s.microAO = ao;
 #ifdef USE_SHEEN
   {
     s.sheenColor = uSheen.rgb;
@@ -794,6 +984,10 @@ void main() {
 
   // ── punctual lights ──
   int lightCount = int(uEnvParams.z);
+#ifdef USE_LOCAL_SHADOWS
+  float localNoise = interleavedGradientNoise(gl_FragCoord.xy + 7.0) * TWO_PI;
+#endif
+  int pomLightBudget = 3;
   for (int i = 0; i < MAX_LIGHTS; i++) {
     if (i >= lightCount) break;
     vec4 pt = uLights[i].posType;
@@ -812,7 +1006,21 @@ void main() {
       float sp = saturate((cd - uLights[i].dirAngle.w) * uLights[i].spot.x);
       att *= sp * sp;
     }
-    if (att > 1e-5) evalLight(s, L, cr.rgb * att, diffuse, specular);
+    if (att > 1e-5) {
+      vec3 lr = cr.rgb * att;
+#ifdef USE_LOCAL_SHADOWS
+      if (uLights[i].spot.y > -0.5 && dot(Ng, L) > -0.2) lr *= localShadowFactor(i, vWorldPos, Ng, L, sqrt(d2), localNoise, 8);
+#endif
+#ifdef USE_HEIGHT
+      // the relief shadows itself toward the closest bright local lights, not only the sun
+      if (pomActive && uPOM3.y > 0.5 && uPOM2.x > 0.001 && pomLightBudget > 0 && luma(lr) > 0.12 && d2 < 144.0) {
+        pomLightBudget--;
+        float sh = pomShadowRay(L, Ng, pomDPdu, pomDPdv, uv, pomTHit, pomAmount, uvDx, uvDy);
+        lr *= mix(1.0, sh, uPOM2.x * pomFadeK);
+      }
+#endif
+      evalLight(s, L, lr, diffuse, specular);
+    }
   }
 
   // ── ambient occlusion (material AO × screen-space AO) ──
@@ -840,6 +1048,11 @@ void main() {
   R = normalize(mix(R, N, alpha));   // bend toward the normal on rough surfaces
   vec3 prefiltered = textureLod(uPrefilter, R, perceptual * maxLod).rgb * envI;
   float specOcc = saturate(pow(NoV + ao, exp2(-16.0 * perceptual - 1.0)) - 1.0 + ao);
+  {
+    // horizon occlusion: a bumpy normal must not reflect what lies below the geometric surface
+    float horizon = saturate(1.0 + dot(R, Ng));
+    specOcc *= mix(1.0, horizon * horizon, 0.85);
+  }
   vec3 specIBL = prefiltered * specAlbedo * s.energyComp * specOcc;
 #ifdef USE_SHEEN
   {

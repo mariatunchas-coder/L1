@@ -353,13 +353,37 @@ uniform sampler2D uTex0;   // depth (full-res)
 uniform sampler2D uTex1;   // G-buffer RT0: velocity.xy, oct normal.zw
 uniform sampler2D uTex2;   // lit scene colour (HDR)
 uniform vec4 uGI;          // x = radius (m), y = thickness (m), z = rays, w = steps
-uniform vec4 uGI2;         // x = frame, y = max radiance (firefly clamp)
+uniform vec4 uGI2;         // x = frame, y = max radiance (firefly clamp), z = multi-bounce feedback gain (0 = off)
+uniform sampler2D uTex3;   // previous frame's GI-lit output (multi-bounce feedback loop)
+uniform sampler3D uVox;    // world-space radiance cache (surface cache)
+uniform vec4 uVoxO;        // xyz = volume min corner, w = cell size
+uniform vec4 uVoxS;        // x = volume size (cells), y = strength (0 = off)
 in vec2 vUv;
 layout(location = 0) out vec4 fragColor;
 
 vec2 giProject(vec3 vp) {
   vec4 h = uProj * vec4(vp, 1.0);
   return h.xy / h.w * 0.5 + 0.5;
+}
+vec3 giViewToWorld(vec3 v) { return transpose(mat3(uView)) * (v - uView[3].xyz); }
+
+// Front-to-back march through the radiance cache; returns premultiplied radiance + coverage.
+vec4 giVoxelMarch(vec3 p0, vec3 dw, float len, float jit) {
+  vec3 acc = vec3(0.0);
+  float T = 1.0;
+  float volSize = uVoxS.x * uVoxO.w;
+  for (int k = 0; k < 6; k++) {
+    float t = len * (float(k) + 0.25 + 0.5 * jit) / 6.0;
+    vec3 uvw = (p0 + dw * t - uVoxO.xyz) / volSize;
+    if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) break;
+    vec4 v = textureLod(uVox, uvw, 0.0);
+    float occ = clamp(v.a, 0.0, 1.0);
+    if (occ > 0.02) {
+      acc += T * (v.rgb / max(v.a, 1e-3)) * occ;
+      T *= 1.0 - occ;
+    }
+  }
+  return vec4(acc, 1.0 - T);
 }
 
 void main() {
@@ -398,13 +422,15 @@ void main() {
     }
     float tPrev = 0.0;
     float tHit = -1.0;
+    bool left = maxT < R - 1e-4;     // the ray was cut by the near plane → it leaves toward the space behind the camera
+    bool broke = false;              // the ray left the screen sideways
     for (int i = 0; i < 32; i++) {
       if (i >= steps) break;
       float f = (float(i) + jit) / float(steps);
       float t = maxT * f * f;
       vec3 sp = O + dir * t;
       vec2 suv = giProject(sp);
-      if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) break;
+      if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) { broke = true; break; }
       float sd = linZ(textureLod(uTex0, suv, 0.0).r);
       float rz = -sp.z;
       float diff = rz - sd;
@@ -420,7 +446,18 @@ void main() {
       }
       tPrev = t;
     }
-    if (tHit < 0.0) continue;
+    if (tHit < 0.0) {
+      // off-screen: continue the ray through the world-space radiance cache instead of giving up
+      if (uVoxS.y > 0.0 && (left || broke)) {
+        float t0 = max(broke ? tPrev : maxT, uVoxO.w * 1.2);
+        if (t0 < R) {
+          vec3 dw = dir * mat3(uView);
+          vec4 vx = giVoxelMarch(giViewToWorld(O) + dw * t0, dw, R - t0, jit);
+          acc += min(vx.rgb, vec3(uGI2.y)) * uVoxS.y * (1.0 - smoothstep(0.5 * R, R, 0.5 * (t0 + R)));
+        }
+      }
+      continue;
+    }
     vec2 huv = giProject(O + dir * tHit);
     ivec2 hp = clamp(ivec2(huv * vec2(fs)), ivec2(0), fs - 1);
     if (texelFetch(uTex0, hp, 0).r >= 1.0) continue;
@@ -429,7 +466,13 @@ void main() {
     if (dot(Nh, dirW) > 0.25) continue;              // hit the back of a surface
     vec2 e = min(huv, 1.0 - huv);
     float w = (1.0 - smoothstep(0.5 * R, R, tHit)) * smoothstep(0.0, 0.06, min(e.x, e.y));
-    acc += min(textureLod(uTex2, huv, 0.0).rgb, vec3(uGI2.y)) * w;
+    vec3 rad = textureLod(uTex2, huv, 0.0).rgb;
+    if (uGI2.z > 0.0) {
+      // multi-bounce: the hit surface already received bounce light last frame – read the GI-lit result (reprojected)
+      vec2 pUv = huv - texelFetch(uTex1, hp, 0).xy;
+      if (pUv.x > 0.0 && pUv.x < 1.0 && pUv.y > 0.0 && pUv.y < 1.0) rad = mix(rad, textureLod(uTex3, pUv, 0.0).rgb, uGI2.z);
+    }
+    acc += min(rad, vec3(uGI2.y)) * w;
   }
   fragColor = vec4(acc / float(max(rays, 1)), 1.0);
 }
@@ -570,5 +613,51 @@ void main() {
   vec3 albedo = sa * sa;
   vec3 bounce = albedo * gi * uGIA.x;
   fragColor = vec4(uGIA.y > 0.5 ? bounce * 2.0 : scene + bounce, 1.0);
+}
+`;
+
+/**
+ * Radiance-cache injection (one z-slice per draw): every voxel that contains a visible surface stores its lit colour,
+ * visible free space fades out, hidden / off-screen voxels keep their history (the world remembers what the camera saw).
+ */
+export const voxelInjectFrag = /* glsl */ `
+#include <common>
+#include <ubo_camera>
+#include <depth_util>
+uniform sampler2D uTex0;      // depth
+uniform sampler2D uTex1;      // lit scene colour
+uniform sampler3D uVoxHist;   // previous volume
+uniform vec4 uVoxOrigin;      // xyz = min corner of the new volume, w = cell size
+uniform vec4 uVoxPrev;        // xyz = min corner of the previous volume, w = history valid
+uniform vec4 uVoxP;           // x = size, y = slice, z = blend rate, w = max radiance
+layout(location = 0) out vec4 fragColor;
+void main() {
+  float n = uVoxP.x;
+  vec3 idx = vec3(floor(gl_FragCoord.xy), uVoxP.y);
+  float cell = uVoxOrigin.w;
+  vec3 wp = uVoxOrigin.xyz + (idx + 0.5) * cell;
+  vec4 hist = vec4(0.0);
+  if (uVoxPrev.w > 0.5) {
+    vec3 huvw = (wp - uVoxPrev.xyz) / (n * cell);
+    if (all(greaterThan(huvw, vec3(0.0))) && all(lessThan(huvw, vec3(1.0)))) hist = textureLod(uVoxHist, huvw, 0.0);
+  }
+  vec4 res = hist;
+  vec4 clip = uViewProj * vec4(wp, 1.0);
+  if (clip.w > 0.0) {
+    vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+    if (uv.x > 0.0 && uv.x < 1.0 && uv.y > 0.0 && uv.y < 1.0) {
+      float d = texture(uTex0, uv).r;
+      float sceneZ = d >= 1.0 ? 1e9 : linZ(d);
+      float diff = clip.w - sceneZ;
+      float halfT = cell * 0.7;
+      if (abs(diff) < halfT) {
+        vec3 col = min(texture(uTex1, uv).rgb, vec3(uVoxP.w));
+        res = mix(hist, vec4(col, 1.0), uVoxP.z);
+      } else if (diff < -halfT) {
+        res = hist * (1.0 - clamp(uVoxP.z * 1.5, 0.0, 1.0));
+      }
+    }
+  }
+  fragColor = res;
 }
 `;

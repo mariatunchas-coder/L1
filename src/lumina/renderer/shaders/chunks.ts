@@ -68,11 +68,19 @@ vec2 skyVelocity(vec2 uv) {
 
   ubo_lights: /* glsl */ `
 #define MAX_LIGHTS 32
+#define MAX_DECALS 8
+#define MAX_LOCAL_LAYERS 8
 struct PunctualLight {
   vec4 posType;     // xyz = world position, w = 1 point / 2 spot
   vec4 colorRange;  // rgb = colour * intensity, w = range (0 = infinite)
   vec4 dirAngle;    // xyz = spot axis, w = cos(outer)
-  vec4 spot;        // x = 1 / (cos(inner) - cos(outer))
+  vec4 spot;        // x = 1 / (cos(inner) - cos(outer)), y = first shadow-atlas layer (-1 = no shadow), z = 1 → cube (point) shadow
+};
+struct DecalData {
+  mat4 inv;         // world → decal space (box [-0.5, 0.5]^3, image on xy, projected along z)
+  vec4 color;       // rgb tint, a = opacity
+  vec4 p1;          // x = atlas layer, y = target roughness (<0 keep), z = normal strength, w = flatten normal (puddles)
+  vec4 p2;          // xyz = projection axis (world, points out of the surface), w = wetness (darkening + gloss)
 };
 layout(std140) uniform Lights {
   vec4 uSunDir;          // xyz = direction toward sun
@@ -87,6 +95,12 @@ layout(std140) uniform Lights {
   vec4 uFogTint;         // rgb = tint, a = enabled
   mat4 uCascadeMatrix[4];
   PunctualLight uLights[MAX_LIGHTS];
+  vec4 uLocalInfo;       // x = enabled, y = softness (texels), z = 1 / map size, w = normal bias (texels)
+  vec4 uExtra;           // x = PCSS on, y = PCSS penumbra (tan of the light's angular radius), z = micro-shadow strength, w = POM local-light shadows
+  vec4 uDecalInfo;       // x = decal count
+  mat4 uLocalShadowMat[MAX_LOCAL_LAYERS];
+  vec4 uLocalShadowParam[MAX_LOCAL_LAYERS]; // x = near, y = far, z = world size of a texel at distance 1, w = constant bias (m)
+  DecalData uDecals[MAX_DECALS];
 };
 `,
 
@@ -167,6 +181,49 @@ float fogShadowSample(vec3 wp, float viewZ) {
   float dist = uShadowInfo.w;
   float s = texture(uShadowMap, vec4(uvz.xy, float(c), uvz.z - bias));
   return mix(1.0, s, saturate((dist - viewZ) / (dist * 0.12)));
+}
+`,
+
+  // Shadow atlas of spot / point lights (a depth array; a point light owns six consecutive layers).
+  // Needs <ubo_lights>. 'taps' = 1 (cheap, volumetric fog) … 8 (surfaces).
+  local_shadow: /* glsl */ `
+uniform sampler2DArrayShadow uLocalShadow;
+float localShadowFactor(int li, vec3 wp, vec3 N, vec3 L, float dist, float noise, int taps) {
+  float base = uLights[li].spot.y;
+  if (base < -0.5) return 1.0;
+  int layer = int(base + 0.5);
+  if (uLights[li].spot.z > 0.5) {
+    vec3 d = -L;
+    vec3 a = abs(d);
+    int face;
+    if (a.x >= a.y && a.x >= a.z) face = d.x > 0.0 ? 0 : 1;
+    else if (a.y >= a.z) face = d.y > 0.0 ? 2 : 3;
+    else face = d.z > 0.0 ? 4 : 5;
+    layer += face;
+  }
+  vec4 prm = uLocalShadowParam[layer];
+  float texelW = prm.z * dist;
+  float NoLg = dot(N, L);
+  float sinT = sqrt(saturate(1.0 - NoLg * NoLg));
+  vec3 p = wp + N * (texelW * uLocalInfo.w * (0.5 + 2.0 * sinT));
+  vec4 c = uLocalShadowMat[layer] * vec4(p, 1.0);
+  if (c.w <= prm.x) return 1.0;
+  vec2 uv = c.xy / c.w * 0.5 + 0.5;
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+  float bias = prm.w + texelW * (1.0 + 2.0 * min(sinT / max(NoLg, 0.2), 4.0));
+  float z = max(c.w - bias, prm.x);
+  float n = prm.x;
+  float f = prm.y;
+  float ndc = ((f + n) * z - 2.0 * f * n) / ((f - n) * z);
+  float ref = clamp(ndc * 0.5 + 0.5, 0.0, 1.0);
+  float radius = uLocalInfo.y * uLocalInfo.z;
+  float sum = 0.0;
+  for (int i = 0; i < 8; i++) {
+    if (i >= taps) break;
+    vec2 o = vogelDisk(i, taps, noise) * radius;
+    sum += texture(uLocalShadow, vec4(uv + o, float(layer), ref));
+  }
+  return sum / float(taps);
 }
 `,
 

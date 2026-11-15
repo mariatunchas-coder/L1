@@ -1,7 +1,7 @@
 import { useEffect, useReducer, useRef, useState } from 'react';
 import { Button, ColorField, Note, Section, Segmented, Select, Slider, Stat, Tabs, Toggle } from './components/ui';
 import { createShowcase, type ModelInfo, type ModelSource, type PickResult, type Showcase } from './demo/buildScene';
-import type { ToneMapping } from './lumina';
+import { detectDevice, type ToneMapping } from './lumina';
 
 interface Settings {
   // langit
@@ -106,6 +106,33 @@ interface Settings {
   pomShadow: number;
   pomAO: number;
   pomSteps: number;
+  // Lumina 4
+  histExposure: boolean;
+  exposureCenter: number;
+  exposureComp: number;
+  opticalVignette: number;
+  energyBloom: boolean;
+  ssgiBounce: boolean;
+  ssgiCache: boolean;
+  ssgiCacheExtent: number;
+  ssgiCacheRes: number;
+  ssgiCacheStrength: number;
+  pcss: boolean;
+  sunPenumbra: number;
+  microShadow: number;
+  localShadows: boolean;
+  localShadowSize: number;
+  localShadowSoft: number;
+  fogLocal: boolean;
+  fogLocalIntensity: number;
+  wetness: number;
+  dust: number;
+  decals: boolean;
+  detail: number;
+  detailRough: number;
+  detailTiling: number;
+  pomBlend: number;
+  pomLocalShadow: boolean;
 }
 
 const DEFAULTS: Settings = {
@@ -197,9 +224,35 @@ const DEFAULTS: Settings = {
   pomShadow: 1,
   pomAO: 0.5,
   pomSteps: 40,
+  histExposure: true,
+  exposureCenter: 0.6,
+  exposureComp: 0,
+  opticalVignette: 0.35,
+  energyBloom: false,
+  ssgiBounce: true,
+  ssgiCache: true,
+  ssgiCacheExtent: 40,
+  ssgiCacheRes: 32,
+  ssgiCacheStrength: 1,
+  pcss: true,
+  sunPenumbra: 0.02,
+  microShadow: 0.6,
+  localShadows: true,
+  localShadowSize: 1024,
+  localShadowSoft: 1.6,
+  fogLocal: true,
+  fogLocalIntensity: 1,
+  wetness: 0.25,
+  dust: 0.12,
+  decals: true,
+  detail: 0.7,
+  detailRough: 0.3,
+  detailTiling: 14,
+  pomBlend: 0.5,
+  pomLocalShadow: true,
 };
 
-const STORAGE_KEY = 'lumina.settings.v4';
+const STORAGE_KEY = 'lumina.settings.v5';
 
 /** Merges untrusted JSON into the defaults, keeping only keys of the right type. */
 function sanitize(raw: unknown): Settings {
@@ -211,21 +264,50 @@ function sanitize(raw: unknown): Settings {
   }
   return out;
 }
+/** First run on phones / weak GPUs: start from a lighter preset instead of the desktop defaults. */
+function deviceDefaults(): Settings {
+  const d = detectDevice();
+  if (d.tier === 'high') return DEFAULTS;
+  const low = d.tier === 'low';
+  return {
+    ...DEFAULTS,
+    ssgi: false,
+    taa: false,
+    ssr: false,
+    contact: false,
+    mb: false,
+    volFog: false,
+    ssgiCache: false,
+    msaa: d.msaa,
+    ssao: !low,
+    pomQuality: low ? 0.35 : 0.6,
+    refrSteps: low ? 8 : 14,
+    shadowSize: low ? 1024 : 2048,
+    cascades: 2,
+    scale: low ? 0.7 : 0.9,
+    dynRes: true,
+    instances: low ? 400 : 800,
+    localShadows: !low,
+    localShadowSize: 512,
+    fogLocal: false,
+    sharpen: 0,
+  };
+}
 function loadSettings(): Settings {
   try {
     const t = localStorage.getItem(STORAGE_KEY);
-    return t ? sanitize(JSON.parse(t)) : DEFAULTS;
+    return t ? sanitize(JSON.parse(t)) : deviceDefaults();
   } catch {
-    return DEFAULTS;
+    return deviceDefaults();
   }
 }
 
 const QUALITY: { name: string; patch: Partial<Settings> }[] = [
-  { name: 'Rendah', patch: { ssgi: false, pomQuality: 0.5, refrSteps: 12, msaa: 0, taa: false, ssao: false, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 1024, cascades: 2, scale: 0.75, volFog: false, bloom: true, sharpen: 0 } },
-  { name: 'Sedang', patch: { ssgi: false, pomQuality: 0.7, refrSteps: 16, msaa: 2, taa: false, ssao: true, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0 } },
-  { name: 'Tinggi', patch: { ssgi: true, ssgiRays: 1, ssgiSteps: 14, pomQuality: 1, refrSteps: 24, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0.25 } },
-  { name: 'Ultra', patch: { ssgi: true, ssgiRays: 1, ssgiSteps: 16, pomQuality: 1, refrSteps: 28, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: true, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.25 } },
-  { name: 'Foto', patch: { ssgi: true, ssgiRays: 2, ssgiSteps: 24, pomQuality: 1, refrSteps: 40, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: true, dof: true, mb: false, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.3, tone: 'agx' } },
+  { name: 'Rendah', patch: { localShadows: false, ssgiCache: false, fogLocal: false, ssgi: false, pomQuality: 0.5, refrSteps: 12, msaa: 0, taa: false, ssao: false, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 1024, cascades: 2, scale: 0.75, volFog: false, bloom: true, sharpen: 0 } },
+  { name: 'Sedang', patch: { localShadows: true, localShadowSize: 512, ssgiCache: false, fogLocal: false, ssgi: false, pomQuality: 0.7, refrSteps: 16, msaa: 2, taa: false, ssao: true, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0 } },
+  { name: 'Tinggi', patch: { localShadows: true, localShadowSize: 1024, ssgiCache: false, fogLocal: true, ssgi: true, ssgiRays: 1, ssgiSteps: 14, pomQuality: 1, refrSteps: 24, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0.25 } },
+  { name: 'Ultra', patch: { localShadows: true, localShadowSize: 1024, ssgiCache: true, ssgiCacheRes: 32, fogLocal: true, ssgi: true, ssgiRays: 1, ssgiSteps: 16, pomQuality: 1, refrSteps: 28, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: true, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.25 } },
+  { name: 'Foto', patch: { localShadows: true, localShadowSize: 2048, ssgiCache: true, ssgiCacheRes: 48, fogLocal: true, ssgi: true, ssgiRays: 2, ssgiSteps: 24, pomQuality: 1, refrSteps: 40, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: true, dof: true, mb: false, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.3, tone: 'agx' } },
 ];
 
 type V3 = [number, number, number];
@@ -291,6 +373,10 @@ mixer.clipAction(gltf.animations[0]).play();
 })();`;
 
 const FEATURES: [string, string][] = [
+  ['Lumina 4 · GI dunia + multi-bounce', 'Radiance cache voxel 3D yang mengikuti kamera (surface-cache ala Lumen) – ray SSGI yang keluar layar membaca cache, sehingga dinding merah di belakang kamera tetap mewarnai lantai di depan. Frame GI di-feedback sehingga cahaya memantul berkali-kali.'],
+  ['Lumina 4 · PCSS + shadow atlas lampu lokal', 'Blocker search per cascade: bayangan tajam di titik kontak, melunak dengan jarak. Spot & point light (cube 6 layer) punya shadow atlas sendiri, ikut menghasilkan god rays di volumetric fog. POM juga self-shadow ke lampu lokal.'],
+  ['Lumina 4 · Material berlapis, detail map & decal', 'Normal height ⊕ normal map (RNM), detail map mikro, lapisan basah/debu, decal terproyeksi (retak, kotor, genangan, jelaga, lumut, goresan) yang dihitung di dalam shader material, micro-shadowing & horizon occlusion.'],
+  ['Lumina 4 · Kamera fisik & optimasi mobile', 'Eksposur histogram center-weighted dengan persentil, kompensasi EV, vignette cos⁴, bloom hemat energi; deteksi GPU mobile otomatis menurunkan geometri, MSAA, preset dan menyalakan dynamic resolution. UV RoundedBox kini arc-length.'],
   ['Screen-Space Global Illumination — SSGI (baru)', 'Pantulan warna tidak langsung antar-objek ala Lumen: ray cosine-weighted di half-res, ray-march depth, akumulasi temporal (reproyeksi velocity + penolakan disocclusion), blur bilateral depth/normal, upsample bilateral × albedo G-buffer'],
   ['Parallax Occlusion Mapping — POM (baru)', 'Kedalaman 3D nyata pada bata, kayu, beton & marmer: ray-march height field + refinement biner, self-shadow matahari, cavity AO, normal dari height map, mip stabil (textureGrad), fade jarak & kualitas adaptif'],
   ['Screen-Space Refraction + dispersi (baru)', 'Ray refraksi di-march menembus depth opaque (parallax benar), bend lensa, dispersi kromatik per kanal RGB (KHR_materials_dispersion), anti-alias mip otomatis, tolak kebocoran objek di depan kaca, fallback ke environment di tepi layar'],
@@ -312,7 +398,7 @@ const FEATURES: [string, string][] = [
   ['Performa', 'Instancing, frustum culling, state cache, UBO, sorting, dirty-flag matrix, resolusi dinamis'],
 ];
 
-type Tab = 'render' | 'effects' | 'model' | 'object';
+type Tab = 'render' | 'effects' | 'l4' | 'model' | 'object';
 
 function download(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob);
@@ -513,6 +599,32 @@ export default function App() {
     sh.setPropsVisible(s.props);
     sh.setModelScale(s.modelFit);
     sh.setModelLights(s.modelLights);
+    // ── Lumina 4 ──
+    p.autoExposureMode = s.histExposure ? 'histogram' : 'average';
+    p.autoExposureCenterWeight = s.exposureCenter;
+    p.exposureCompensation = s.exposureComp;
+    p.opticalVignette = s.opticalVignette;
+    p.bloom.energyConserving = s.energyBloom;
+    p.ssgi.multiBounce = s.ssgiBounce;
+    p.ssgi.worldCache = s.ssgiCache;
+    p.ssgi.worldCacheExtent = s.ssgiCacheExtent;
+    p.ssgi.worldCacheResolution = s.ssgiCacheRes;
+    p.ssgi.worldCacheStrength = s.ssgiCacheStrength;
+    sh.sun.shadow.pcss = s.pcss;
+    sh.sun.shadow.penumbra = s.sunPenumbra;
+    r.microShadowing = s.microShadow;
+    r.localShadows.enabled = s.localShadows;
+    r.localShadows.mapSize = s.localShadowSize;
+    r.localShadows.softness = s.localShadowSoft;
+    sh.spot.castShadow = s.localShadows;
+    sh.neonLight.castShadow = s.localShadows;
+    p.volumetricFog.localLights = s.fogLocal;
+    p.volumetricFog.localIntensity = s.fogLocalIntensity;
+    sh.setSurfaceLayers(s.wetness, s.dust);
+    r.decalsEnabled = s.decals;
+    sh.setDecalsVisible(s.decals);
+    sh.setDetail(s.detail, s.detail > 0 ? s.detailRough : 0, s.detailTiling);
+    sh.setPomBlend(s.pomBlend, s.pomLocalShadow);
     sh.adaptive.targetFps = s.adaptiveFps;
     sh.adaptive.enabled = s.adaptive;
   }, [s, ready]);
@@ -600,7 +712,7 @@ export default function App() {
           </div>
           <div>
             <div className="text-sm font-semibold tracking-wide text-white drop-shadow">LUMINA</div>
-            <div className="text-[10px] uppercase tracking-[0.2em] text-slate-300/80 drop-shadow">WebGL2 · SSGI · POM · Refraksi + Dispersi · AgX</div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-slate-300/80 drop-shadow">WebGL2 · Lumina 4 · GI cache · PCSS · Decal · AgX</div>
           </div>
         </div>
       </div>
@@ -665,6 +777,7 @@ export default function App() {
             tabs={[
               { id: 'render', label: 'Render' },
               { id: 'effects', label: 'Efek' },
+              { id: 'l4', label: 'L4' },
               { id: 'model', label: 'Model' },
               { id: 'object', label: 'Objek' },
             ]}
@@ -913,6 +1026,75 @@ export default function App() {
             </>
           )}
 
+          {tab === 'l4' && (
+            <>
+              <Section title="Perangkat & optimasi otomatis">
+                {showRef.current && (
+                  <Note tone={showRef.current.device.tier === 'high' ? 'info' : 'warn'}>
+                    GPU: {showRef.current.device.gpu.slice(0, 60)} · kelas <b>{showRef.current.device.tier}</b>
+                    {showRef.current.device.mobile ? ' (mobile)' : ''} · {showRef.current.device.reasons.join(', ')}. Detail geometri ×{showRef.current.device.geometryDetail.toFixed(2)}.
+                  </Note>
+                )}
+                <Button variant="primary" onClick={() => { const d = detectDevice(); patch({ ...deviceDefaults(), ...(d.tier === 'high' ? { dynRes: false } : {}) }); say('Optimasi perangkat diterapkan'); }}>
+                  Terapkan preset otomatis perangkat
+                </Button>
+              </Section>
+
+              <Section title="GI dunia (surface cache) & multi-bounce">
+                <Toggle label="Multi-bounce SSGI" hint="frame GI diumpan balik → cahaya memantul berkali-kali" value={s.ssgiBounce} onChange={(v) => set('ssgiBounce', v)} />
+                <Toggle label="World-space radiance cache" hint="voxel 3D mengikuti kamera; ray off-screen membaca cache" value={s.ssgiCache} onChange={(v) => set('ssgiCache', v)} />
+                {s.ssgiCache && (
+                  <>
+                    <Slider label="Jangkauan cache" value={s.ssgiCacheExtent} min={12} max={120} step={1} onChange={(v) => set('ssgiCacheExtent', v)} fmt={(v) => v.toFixed(0) + ' m'} />
+                    <Segmented label="Resolusi voxel" value={s.ssgiCacheRes} options={[16, 24, 32, 48].map((n) => ({ label: n + '³', value: n }))} onChange={(v) => set('ssgiCacheRes', v)} />
+                    <Slider label="Kekuatan GI off-screen" value={s.ssgiCacheStrength} min={0} max={2} onChange={(v) => set('ssgiCacheStrength', v)} />
+                  </>
+                )}
+                {!s.ssgi && <Note>Aktifkan SSGI di tab Efek agar bagian ini berpengaruh.</Note>}
+              </Section>
+
+              <Section title="Bayangan: PCSS & lampu lokal">
+                <Toggle label="PCSS (penumbra dinamis)" hint="blocker search: tajam di kontak, lembut di jauh" value={s.pcss} onChange={(v) => set('pcss', v)} />
+                {s.pcss && <Slider label="Ukuran sumber cahaya" value={s.sunPenumbra} min={0.002} max={0.08} step={0.001} onChange={(v) => set('sunPenumbra', v)} fmt={(v) => v.toFixed(3)} />}
+                <Slider label="Micro-shadowing" hint="rongga material menggelapkan cahaya miring" value={s.microShadow} min={0} max={1} onChange={(v) => set('microShadow', v)} />
+                <Toggle label="Bayangan spot / point light" hint="shadow atlas 8 layer (point = 6 layer)" value={s.localShadows} onChange={(v) => set('localShadows', v)} />
+                {s.localShadows && (
+                  <>
+                    <Segmented label="Resolusi atlas" value={s.localShadowSize} options={[512, 1024, 2048].map((n) => ({ label: String(n), value: n }))} onChange={(v) => set('localShadowSize', v)} />
+                    <Slider label="Kelembutan" value={s.localShadowSoft} min={0.5} max={6} onChange={(v) => set('localShadowSoft', v)} fmt={(v) => v.toFixed(1) + ' texel'} />
+                  </>
+                )}
+                <Toggle label="God rays dari lampu lokal" hint="butuh Volumetric fog (tab Render)" value={s.fogLocal} onChange={(v) => set('fogLocal', v)} />
+                {s.fogLocal && <Slider label="Intensitas cahaya fog lokal" value={s.fogLocalIntensity} min={0} max={4} onChange={(v) => set('fogLocalIntensity', v)} />}
+                {!s.volFog && <Note>Nyalakan "Volumetric fog" untuk melihat berkas cahaya lampu sorot & neon.</Note>}
+              </Section>
+
+              <Section title="Kamera fisik & eye adaptation">
+                <Toggle label="Eksposur histogram" hint="64 bin EV + persentil, center-weighted" value={s.histExposure} onChange={(v) => set('histExposure', v)} />
+                <Slider label="Bobot tengah (metering)" value={s.exposureCenter} min={0} max={1} onChange={(v) => set('exposureCenter', v)} />
+                <Slider label="Kompensasi eksposur" value={s.exposureComp} min={-3} max={3} step={0.1} onChange={(v) => set('exposureComp', v)} fmt={(v) => (v >= 0 ? '+' : '') + v.toFixed(1) + ' EV'} />
+                <Slider label="Vignette optik (cos⁴)" value={s.opticalVignette} min={0} max={1} onChange={(v) => set('opticalVignette', v)} />
+                <Toggle label="Bloom hemat energi" hint="menyebar, bukan menambah cahaya" value={s.energyBloom} onChange={(v) => set('energyBloom', v)} />
+              </Section>
+
+              <Section title="Material berlapis, detail & decal">
+                <Slider label="Basah (wetness)" hint="gelap + licin, mengisi cekungan dulu" value={s.wetness} min={0} max={1} onChange={(v) => set('wetness', v)} />
+                <Slider label="Debu (dust)" hint="mengendap di permukaan atas" value={s.dust} min={0} max={1} onChange={(v) => set('dust', v)} />
+                <Slider label="Detail map: normal" value={s.detail} min={0} max={1.5} onChange={(v) => set('detail', v)} />
+                <Slider label="Detail map: roughness" hint="sidik jari / goresan mikro" value={s.detailRough} min={0} max={0.8} onChange={(v) => set('detailRough', v)} />
+                <Slider label="Tiling detail" value={s.detailTiling} min={2} max={60} step={1} onChange={(v) => set('detailTiling', v)} fmt={(v) => v.toFixed(0) + '×'} />
+                <Toggle label="Decal (retak, kotor, genangan, lumut)" value={s.decals} onChange={(v) => set('decals', v)} />
+                <Slider label="Normal height ⊕ normal map" hint="RNM; 0 = hanya normal map" value={s.pomBlend} min={0} max={1} onChange={(v) => set('pomBlend', v)} />
+                <Toggle label="Self-shadow POM untuk lampu lokal" value={s.pomLocalShadow} onChange={(v) => set('pomLocalShadow', v)} />
+                <div className="grid grid-cols-3 gap-1.5">
+                  <Button onClick={() => showRef.current?.setCameraPreset('decals')}>Dinding</Button>
+                  <Button onClick={() => showRef.current?.setCameraPreset('wet')}>Genangan</Button>
+                  <Button onClick={() => showRef.current?.setCameraPreset('gi')}>GI</Button>
+                </div>
+              </Section>
+            </>
+          )}
+
           {tab === 'model' && (
             <>
               <Section title="Muat model glTF / GLB">
@@ -1066,7 +1248,7 @@ export default function App() {
               <div>
                 <h2 className="text-xl font-semibold text-white">Lumina Engine</h2>
                 <p className="text-sm text-slate-400">
-                  Library rendering WebGL2 (Lumina 3) — fokus pada performa dan realisme ala game engine: SSGI, POM, refraksi + dispersi. Seluruh kode ada di <code className="text-sky-300">src/lumina/</code>.
+                  Library rendering WebGL2 (Lumina 4) — fokus pada performa dan realisme ala game engine: GI dunia + multi-bounce, PCSS, shadow lampu lokal, god rays, eksposur histogram, decal, material berlapis, SSGI, POM, refraksi + dispersi. Seluruh kode ada di <code className="text-sky-300">src/lumina/</code>.
                 </p>
               </div>
               <button onClick={() => setAbout(false)} className="rounded-md px-2 py-1 text-slate-400 hover:bg-white/10 hover:text-white">

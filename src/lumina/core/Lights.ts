@@ -28,8 +28,12 @@ export interface CascadedShadowSettings {
   bias: number;
   /** Normal offset in shadow texels. */
   normalBias: number;
-  /** Penumbra radius in texels (PCF disk). */
+  /** Minimum penumbra radius in texels (PCF disk). */
   softness: number;
+  /** Percentage-closer soft shadows: the penumbra widens with the distance between occluder and receiver (blocker search). */
+  pcss: boolean;
+  /** PCSS: tangent of the light's angular radius (0.0047 = the real sun; larger = softer, artistic). */
+  penumbra: number;
 }
 
 /** Sun-like light with cascaded shadow maps. */
@@ -43,6 +47,8 @@ export class DirectionalLight extends Light {
     bias: 0.03,
     normalBias: 1.4,
     softness: 1.6,
+    pcss: true,
+    penumbra: 0.02,
   };
   constructor(color: number | string | Color = 0xffffff, intensity = 3) {
     super(color, intensity);

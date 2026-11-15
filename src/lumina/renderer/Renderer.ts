@@ -5,6 +5,8 @@ import { InstancedMesh, Mesh } from '../core/Mesh';
 import type { LOD } from '../core/LOD';
 import type { Object3D } from '../core/Object3D';
 import type { Scene } from '../core/Scene';
+import { DECAL_KINDS, type Decal } from '../core/Decal';
+import { detectDevice, type DeviceProfile } from '../quality/Device';
 import { Sky } from '../core/Sky';
 import { Frustum } from '../math/Bounds';
 import { clamp } from '../math/MathUtils';
@@ -18,6 +20,8 @@ import { Program, UBO_CAMERA, UBO_LIGHTS } from './Program';
 import { GpuTimer } from './GpuTimer';
 import { ColorTarget, DepthTarget, GBufferTarget, createColorTarget, createDepthTarget, createGBuffer, deleteColorTarget, deleteGBuffer } from './RenderTarget';
 import { Resources } from './Resources';
+import { DecalAtlas } from './DecalAtlas';
+import { LocalShadows, LocalShadowSettings, defaultLocalShadowSettings } from './LocalShadows';
 import { depthFrag, depthVert, gbufFrag, gbufVert, pbrFrag, pbrVert } from './shaders/pbr';
 
 export interface RendererOptions {
@@ -92,12 +96,25 @@ const F_MAP = 1,
   /** frame-level: transmissive materials ray-march their refracted ray through the opaque depth */
   F_SSREFRACT = 16777216,
   /** G-buffer program key only: the albedo attachment exists */
-  F_GBUF_ALBEDO = 33554432;
+  F_GBUF_ALBEDO = 33554432,
+  /** Lumina 4 – material: tiling detail map / wet+dust layers; frame-level: decals, local-light shadows, PCSS */
+  F_DECALS = 67108864,
+  F_DETAIL = 134217728,
+  F_LAYERS = 268435456,
+  F_LOCALSHADOW = 536870912,
+  F_PCSS = 1073741824;
 
 const isWater = (m: Material): boolean => m.kind === 'pbr' && (m as PBRMaterial).waves > 0;
 
 const CAM_FLOATS = 108;
-const LIGHT_FLOATS = 104 + 32 * 16;
+// std140 layout of the `Lights` block (floats): header 0‥103, lights 104‥615, local-shadow info 616‥627,
+// local-shadow matrices 628‥755, per-layer params 756‥787, decals 788‥1011 (28 floats each)
+const LIGHT_FLOATS = 788 + 8 * 28;
+const OFF_LOCAL = 32 * 16 + 104;
+const OFF_LMAT = OFF_LOCAL + 12;
+const OFF_LPAR = OFF_LMAT + 128;
+const OFF_DECAL = OFF_LPAR + 32;
+const MAX_DECALS = 8;
 const MAX_LIGHTS = 32;
 
 const _vp = new Matrix4();
@@ -123,6 +140,7 @@ const HALTON: [number, number][] = (() => {
 const _tmp = new Vector3();
 const _sunDir = new Vector3();
 const _frustum = new Frustum();
+const _dm = new Matrix4();
 
 export class Renderer {
   readonly canvas: HTMLCanvasElement;
@@ -150,6 +168,14 @@ export class Renderer {
   parallax = { enabled: true, quality: 1 };
   /** Distance (m) beyond which the parallax relief fades out to flat shading (saves the ray march on far surfaces). */
   parallaxFade = 45;
+  /** Shadow atlas of spot / point lights (set `light.castShadow = true`; max 8 layers: a point light needs 6, a spot light 1). */
+  localShadows: LocalShadowSettings = defaultLocalShadowSettings();
+  /** Projected decals (see `Decal`): the closest 8 are used. */
+  decalsEnabled = true;
+  /** 0 … 1 – micro-shadowing of direct light by material cavities (ambient-occlusion maps, parallax cavities). */
+  microShadowing = 0.6;
+  /** GPU class / mobile detection used for the automatic defaults (MSAA, pixel ratio) and by `applyDeviceQuality`. */
+  readonly device: DeviceProfile;
 
   readonly info: RenderInfo = {
     calls: 0,
@@ -222,6 +248,12 @@ export class Renderer {
   private pool: RenderItem[] = [];
   private poolIndex = 0;
   private casters: Mesh[] = [];
+  private ls!: LocalShadows;
+  private decalAtlas: DecalAtlas | null = null;
+  private decalList: Decal[] = [];
+  private sortedLights: Light[] = [];
+  private rawSampler: WebGLSampler | null = null;
+  private dummyDepth: WebGLTexture | null = null;
   private casterSpheres = new Float64Array(256 * 4);
   private lights: Light[] = [];
   private sun: DirectionalLight | null = null;
@@ -253,8 +285,9 @@ export class Renderer {
       maxSamples: gl.getParameter(gl.MAX_SAMPLES) as number,
       gpu: dbg ? (gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) as string) : 'unknown',
     };
-    this.samples = Math.min(opts.samples ?? 4, this.capabilities.maxSamples);
-    this.pixelRatio = opts.pixelRatio ?? Math.min(window.devicePixelRatio || 1, 2);
+    this.device = detectDevice(this.capabilities.gpu);
+    this.samples = Math.min(opts.samples ?? this.device.msaa, this.capabilities.maxSamples);
+    this.pixelRatio = opts.pixelRatio ?? Math.min(window.devicePixelRatio || 1, this.device.pixelRatioCap);
 
     const on = (type: string, fn: EventListener) => {
       this.canvas.addEventListener(type, fn);
@@ -306,6 +339,26 @@ export class Renderer {
     this.bgProgram = createBackgroundProgram(gl, this.state);
     this.post_ = new PostProcessor(gl, this.state);
     this.csm = new CascadedShadows(gl, this.state);
+    this.ls = new LocalShadows(gl, this.state);
+    this.decalAtlas = null;
+    // sampler object that reads the cascade depth array *without* comparison (PCSS blocker search) on unit 15
+    const rs = gl.createSampler()!;
+    gl.samplerParameteri(rs, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.samplerParameteri(rs, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.samplerParameteri(rs, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.samplerParameteri(rs, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.samplerParameteri(rs, gl.TEXTURE_COMPARE_MODE, gl.NONE);
+    gl.bindSampler(15, rs);
+    this.rawSampler = rs;
+    // 1×1 depth array: keeps unused shadow samplers of the fog pass valid
+    const dd = gl.createTexture()!;
+    this.state.bindScratch(TEX_2D_ARRAY, dd);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.DEPTH_COMPONENT24, 1, 1, 1);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+    this.dummyDepth = dd;
     this.timer = new GpuTimer(gl);
 
     // forget every handle of the previous context (they are invalid after a restore)
@@ -401,7 +454,25 @@ export class Renderer {
 
   private warmPrograms(scene: Scene): Program[] {
     const P = this.post;
-    const frame = (this.shadowsEnabled ? F_SHADOWS : 0) | (P.ssao.enabled ? F_SSAO : 0) | (scene.fog ? F_FOG : 0) | (P.contactShadows.enabled ? F_CONTACT : 0);
+    let sunPcss = false,
+      hasDecals = false,
+      localCasters = 0;
+    const scan = (o: Object3D): void => {
+      if (o.isLight) {
+        const l = o as Light;
+        if (l.type === 'DirectionalLight') sunPcss = sunPcss || (l as DirectionalLight).shadow.pcss;
+        else if (l.castShadow) localCasters++;
+      } else if ((o as Decal).isDecal) hasDecals = true;
+      for (const c of o.children) scan(c);
+    };
+    scan(scene);
+    const frame =
+      (this.shadowsEnabled ? F_SHADOWS | (sunPcss ? F_PCSS : 0) | (this.localShadows.enabled && localCasters > 0 ? F_LOCALSHADOW : 0) : 0) |
+      (P.ssao.enabled ? F_SSAO : 0) |
+      (scene.fog ? F_FOG : 0) |
+      (P.contactShadows.enabled ? F_CONTACT : 0) |
+      (P.refraction.screenSpace ? F_SSREFRACT : 0) |
+      (this.decalsEnabled && hasDecals ? F_DECALS : 0);
     const gbuf = P.taa.enabled || P.ssr.enabled || P.motionBlur.enabled || P.ssgi.enabled;
     const out = new Set<Program>();
     const visit = (o: Object3D): void => {
@@ -409,12 +480,7 @@ export class Renderer {
         const mesh = o as Mesh;
         const mat = mesh.material;
         if (mat.visible) {
-          let flags = this.featureFlags(mesh, mat);
-          if (!(flags & F_UNLIT)) {
-            flags |= frame & (F_SSAO | F_FOG);
-            if (mesh.receiveShadow) flags |= frame & (F_SHADOWS | (flags & F_WATER ? 0 : F_CONTACT));
-            if (flags & F_TRANSMISSION && !(flags & F_WATER) && P.refraction.screenSpace) flags |= F_SSREFRACT;
-          }
+          const flags = this.resolveFlags(this.featureFlags(mesh, mat), mesh, mat, frame);
           out.add(this.getProgram(flags));
           if (!mat.transparent) out.add(gbuf ? this.getGBufProgram(flags, P.ssgi.enabled) : this.getDepthProgram(flags));
           if (mesh.castShadow && !mat.transparent) out.add(this.getDepthProgram(this.featureFlags(mesh, mat)));
@@ -529,16 +595,24 @@ export class Renderer {
     const useSSAO = this.post.ssao.enabled;
     const useGBuf = needColor && !!this.depthPre && this.depthPre.hasColor;
     // volumetric fog needs its own shadow-mapped sun, and a depth buffer to raymarch against
-    const useVolumetricFog = this.post.volumetricFog.enabled && useShadows;
+    // spot / point lights: priority order (shadow casters first, then nearest), shadow atlas planning
+    this.sortLights(camera);
+    this.ls.plan(this.shadowsEnabled && this.casters.length > 0 ? this.sortedLights : [], this.localShadows);
+    const useLocalShadows = this.ls.active;
+    const usePCSS = useShadows && sun!.shadow.pcss;
+    const decalCount = this.decalsEnabled ? Math.min(this.decalList.length, MAX_DECALS) : 0;
+    // volumetric fog is driven by the sun's cascades and by local lights (god rays), so either is enough
+    const useVolumetricFog = this.post.volumetricFog.enabled && (useShadows || this.lights.length > 0);
     const useDepthPre = useSSAO || useVolumetricFog || needDepth;
     const useContact = needContact && !!this.depthPre;
     const fog = scene.fog;
 
     if (useShadows) this.renderShadows(sun!, camera);
+    if (useLocalShadows) this.renderLocalShadows();
     if (useDepthPre) this.renderDepthPrepass(_vp, useGBuf);
     const aoTex = useSSAO ? this.post_.renderSSAO(this.depthPre!.texture, camera, this.post.ssao, rw, rh) : null;
 
-    this.fillLights(scene, camera, sun, useShadows);
+    this.fillLights(scene, camera, sun, useShadows, decalCount);
 
     // ── main HDR pass ──
     const sceneFbo = this.samples > 0 ? this.msaaFbo! : this.hdr!.fbo;
@@ -556,6 +630,12 @@ export class Renderer {
     st.bindTexture(1, TEX_CUBE, this.env.prefilter);
     st.bindTexture(2, TEX_2D, this.env.brdfLut);
     if (useShadows && this.csm.texture) st.bindTexture(3, TEX_2D_ARRAY, this.csm.texture);
+    if (usePCSS && this.csm.texture) st.bindTexture(15, TEX_2D_ARRAY, this.csm.texture);
+    if (useLocalShadows && this.ls.texture) st.bindTexture(14, TEX_2D_ARRAY, this.ls.texture);
+    if (decalCount > 0) {
+      if (!this.decalAtlas) this.decalAtlas = new DecalAtlas(gl, st);
+      st.bindTexture(10, TEX_2D_ARRAY, this.decalAtlas.texture);
+    }
     if (aoTex) st.bindTexture(4, TEX_2D, aoTex);
     st.bindTexture(9, TEX_CUBE, this.env.backgroundCube);
     const sceneDepthTex = this.needDepthCopy && this.depthCopy ? this.depthCopy.texture : this.depthPre ? this.depthPre.texture : null;
@@ -564,7 +644,13 @@ export class Renderer {
     for (const p of this.programs.values()) p.lastMaterial = null;
     this.textureMaterial = null;
     const frameFlags =
-      (useShadows ? F_SHADOWS : 0) | (useSSAO ? F_SSAO : 0) | (fog ? F_FOG : 0) | (useContact ? F_CONTACT : 0) | (refractSS && this.depthCopy ? F_SSREFRACT : 0);
+      (useShadows ? F_SHADOWS | (usePCSS ? F_PCSS : 0) : 0) |
+      (useLocalShadows ? F_LOCALSHADOW : 0) |
+      (decalCount > 0 ? F_DECALS : 0) |
+      (useSSAO ? F_SSAO : 0) |
+      (fog ? F_FOG : 0) |
+      (useContact ? F_CONTACT : 0) |
+      (refractSS && this.depthCopy ? F_SSREFRACT : 0);
     if (useContact) this.contact = P.contactShadows;
 
     this.opaque.sort((a, b) => a.order - b.order || a.flags - b.flags || a.matId - b.matId || a.z - b.z);
@@ -594,14 +680,23 @@ export class Renderer {
     const p = this.post;
     const hdrTex = this.hdr!.texture;
     const fogTex = useVolumetricFog
-      ? this.post_.renderVolumetricFog(this.depthPre!.texture, this.csm.texture!, camera, p.volumetricFog, rw, rh)
+      ? this.post_.renderVolumetricFog(
+          this.depthPre!.texture,
+          useShadows && this.csm.texture ? this.csm.texture : this.dummyDepth!,
+          useLocalShadows && this.ls.texture ? this.ls.texture : this.dummyDepth!,
+          camera,
+          p.volumetricFog,
+          p.volumetricFog.localLights ? Math.min(this.sortedLights.length, Math.min(12, this.localShadows.maxFogLights)) : 0,
+          rw,
+          rh
+        )
       : null;
 
     // ── G-buffer driven effects: SSR → TAA → DoF → motion blur (each reads the previous result) ──
     let cur = hdrTex;
     const gb = this.depthPre;
     if (gb && useGBuf) {
-      if (p.ssgi.enabled && gb.hasAlbedo) cur = this.post_.renderSSGI(cur, gb, p.ssgi, rw, rh, this.frameCount, this.temporalReset);
+      if (p.ssgi.enabled && gb.hasAlbedo) cur = this.post_.renderSSGI(cur, gb, p.ssgi, rw, rh, this.frameCount, this.temporalReset, camera.getWorldPosition(_tmp));
       else this.post_.resetGI();
       if (p.ssr.enabled) {
         const ssrTex = this.post_.renderSSR(cur, gb, camera, p.ssr, rw, rh, this.frameCount);
@@ -649,6 +744,10 @@ export class Renderer {
     this.env.dispose();
     this.post_.dispose();
     this.csm.dispose();
+    this.ls.dispose();
+    this.decalAtlas?.dispose();
+    if (this.rawSampler) this.gl.deleteSampler(this.rawSampler);
+    if (this.dummyDepth) this.gl.deleteTexture(this.dummyDepth);
     for (const p of this.programs.values()) p.dispose();
     for (const p of this.depthPrograms.values()) p.dispose();
     for (const p of this.gbufPrograms.values()) p.dispose();
@@ -745,6 +844,7 @@ export class Renderer {
     this.hasGlass = false;
     this.frameMeshes.length = 0;
     this.lights.length = 0;
+    this.decalList.length = 0;
     this.sun = null;
     this.poolIndex = 0;
     this.visit(scene, camera);
@@ -758,6 +858,8 @@ export class Renderer {
       if (l.type === 'DirectionalLight') {
         if (!this.sun && l.intensity > 0) this.sun = l as DirectionalLight;
       } else this.lights.push(l);
+    } else if ((o as Decal).isDecal) {
+      this.decalList.push(o as Decal);
     } else if (o.isMesh) {
       const mesh = o as Mesh;
       const mat = mesh.material;
@@ -802,6 +904,19 @@ export class Renderer {
     for (let i = 0; i < ch.length; i++) this.visit(ch[i], camera);
   }
 
+  /** Adds the frame-level feature bits (shadows, fog, decals …) that apply to this mesh / material. */
+  private resolveFlags(base: number, mesh: Mesh, mat: Material, frame: number): number {
+    let flags = base;
+    if (!(flags & F_UNLIT)) {
+      flags |= frame & (F_SSAO | F_FOG);
+      if (mesh.receiveShadow) flags |= frame & (F_SHADOWS | F_PCSS | F_LOCALSHADOW | (flags & F_WATER ? 0 : F_CONTACT));
+      if (flags & F_TRANSMISSION) {
+        if (!(flags & F_WATER)) flags |= frame & F_SSREFRACT;
+      } else if (frame & F_DECALS && (mat as PBRMaterial).receiveDecals) flags |= F_DECALS;
+    }
+    return flags;
+  }
+
   private featureFlags(mesh: Mesh, m: Material): number {
     let f = 0;
     const inst = mesh as InstancedMesh;
@@ -822,7 +937,9 @@ export class Renderer {
       if (p.anisotropy !== 0) f |= F_ANISO;
       const heightOn = !!p.heightMap && this.parallax.enabled;
       if (heightOn) f |= F_HEIGHT;
-      if ((p.normalMap || p.anisotropy !== 0 || heightOn) && mesh.geometry.attributes.tangent) f |= F_TANGENT;
+      if (p.detailMap) f |= F_DETAIL;
+      if (p.layers || p.wetness > 0.001 || p.dust > 0.001) f |= F_LAYERS;
+      if ((p.normalMap || p.anisotropy !== 0 || heightOn || p.detailMap) && mesh.geometry.attributes.tangent) f |= F_TANGENT;
       if (p.ormMap) f |= F_ORM;
       if (p.emissiveMap) f |= F_EMISSIVEMAP;
       if (p.clearcoat > 0) f |= F_CLEARCOAT;
@@ -869,6 +986,11 @@ export class Renderer {
       if (flags & F_HEIGHT) d.push('USE_HEIGHT');
       if (flags & F_DISPERSION) d.push('USE_DISPERSION');
       if (flags & F_SSREFRACT) d.push('USE_SSREFRACT');
+      if (flags & F_DECALS) d.push('USE_DECALS');
+      if (flags & F_DETAIL) d.push('USE_DETAIL');
+      if (flags & F_LAYERS) d.push('USE_LAYERS');
+      if (flags & F_LOCALSHADOW) d.push('USE_LOCAL_SHADOWS');
+      if (flags & F_PCSS) d.push('USE_PCSS');
       p = new Program(this.gl, this.state, pbrVert, pbrFrag, d, 'pbr[' + d.join(',') + ']', this.parallelExt);
       this.programs.set(flags, p);
     }
@@ -951,12 +1073,7 @@ export class Renderer {
     const st = this.state;
     const mesh = item.mesh;
     const mat = item.material;
-    let flags = item.flags;
-    if (!(flags & F_UNLIT)) {
-      flags |= frameFlags & (F_SSAO | F_FOG);
-      if (mesh.receiveShadow) flags |= frameFlags & (F_SHADOWS | (flags & F_WATER ? 0 : F_CONTACT));
-      if (flags & F_TRANSMISSION && !(flags & F_WATER)) flags |= frameFlags & F_SSREFRACT;
-    }
+    const flags = this.resolveFlags(item.flags, mesh, mat, frameFlags);
     const program = this.getProgram(flags);
     if (!this.ready(program)) return;
     program.use();
@@ -970,6 +1087,7 @@ export class Renderer {
         if (m.ormMap) st.bindTexture(7, TEX_2D, this.resources.getTexture(m.ormMap));
         if (m.emissiveMap) st.bindTexture(8, TEX_2D, this.resources.getTexture(m.emissiveMap));
         if (m.heightMap && flags & F_HEIGHT) st.bindTexture(13, TEX_2D, this.resources.getTexture(m.heightMap));
+        if (m.detailMap && flags & F_DETAIL) st.bindTexture(9, TEX_2D, this.resources.getTexture(m.detailMap));
       } else {
         const m = mat as UnlitMaterial;
         if (m.map) st.bindTexture(5, TEX_2D, this.resources.getTexture(m.map));
@@ -1005,6 +1123,12 @@ export class Renderer {
         if (flags & F_HEIGHT) {
           gl.uniform4f(L.uPOM, Math.max(0, m.parallaxScale), clamp(m.parallaxMinSteps, 4, 64), clamp(m.parallaxMaxSteps, 4, 64), this.parallaxFade);
           gl.uniform4f(L.uPOM2, clamp(m.parallaxSelfShadow, 0, 1), clamp(m.parallaxAO, 0, 1), clamp(this.parallax.quality, 0.15, 1), 0);
+          gl.uniform2f(L.uPOM3, clamp(m.parallaxNormalBlend, 0, 1), m.parallaxLocalShadow ? 1 : 0);
+        }
+        if (flags & F_DETAIL) gl.uniform4f(L.uDetail, Math.max(0.01, m.detailScale), m.detailNormalScale, m.detailRoughness, Math.max(0.5, m.detailDistance));
+        if (flags & F_LAYERS) {
+          gl.uniform4f(L.uLayers, clamp(m.wetness, 0, 1), clamp(m.dust, 0, 1), Math.max(0.01, m.layerScale), 0);
+          gl.uniform3f(L.uDustColor, m.dustColor.r, m.dustColor.g, m.dustColor.b);
         }
         if (flags & F_SSREFRACT) {
           const rf = this.post.refraction;
@@ -1170,6 +1294,72 @@ export class Renderer {
     st.setColorMask(true);
   }
 
+  /** Renders the spot / point shadow atlas planned by `LocalShadows.plan` (point lights: six cube faces). */
+  private renderLocalShadows(): void {
+    const gl = this.gl;
+    const st = this.state;
+    const ls = this.ls;
+    ls.ensure(Math.max(128, Math.min(4096, Math.round(this.localShadows.mapSize))));
+    st.setDepth(true, true);
+    st.setBlend(0);
+    st.setColorMask(false);
+    st.setPolygonOffset(true, 2, 4);
+    st.setViewport(0, 0, ls.size, ls.size);
+    const sp = this.casterSpheres;
+    for (const e of ls.entries) {
+      const le = e.light.matrixWorld.elements;
+      for (let f = 0; f < e.count; f++) {
+        const layer = e.layer + f;
+        st.bindFramebuffer(ls.fbos[layer]);
+        gl.clear(gl.DEPTH_BUFFER_BIT);
+        const fr = ls.frustums[layer];
+        let bound: Program | null = null;
+        for (let i = 0; i < this.casters.length; i++) {
+          const mesh = this.casters[i];
+          const r = sp[i * 4 + 3];
+          // huge instanced fields never cast local-light shadows (their bounding sphere would pull in every instance)
+          if ((mesh as InstancedMesh).instanceMatrix && r > e.far) continue;
+          const dx = sp[i * 4] - le[12],
+            dy = sp[i * 4 + 1] - le[13],
+            dz = sp[i * 4 + 2] - le[14];
+          if (dx * dx + dy * dy + dz * dz > (e.far + r) * (e.far + r)) continue;
+          if (!fr.intersectsSphere(sp[i * 4], sp[i * 4 + 1], sp[i * 4 + 2], r)) continue;
+          const flags = this.featureFlags(mesh, mesh.material);
+          const prog = this.getDepthProgram(flags);
+          if (!this.ready(prog)) continue;
+          if (prog !== bound) {
+            prog.use();
+            gl.uniformMatrix4fv(prog.loc.uViewProj, false, ls.viewProj[layer].elements);
+            bound = prog;
+          }
+          this.drawDepthMesh(mesh, prog, flags);
+          this.info.shadowCalls++;
+        }
+      }
+    }
+    st.setPolygonOffset(false);
+    st.setColorMask(true);
+  }
+
+  /** Spot / point lights in priority order: shadow casters first, then by distance to the camera (closest MAX_LIGHTS). */
+  private sortLights(camera: PerspectiveCamera): void {
+    camera.getWorldPosition(_tmp);
+    const cx = _tmp.x,
+      cy = _tmp.y,
+      cz = _tmp.z;
+    const list = this.sortedLights;
+    list.length = 0;
+    for (const l of this.lights) list.push(l);
+    if (list.length > 1) {
+      const dist = (l: Light) => {
+        const e = l.matrixWorld.elements;
+        return (e[12] - cx) ** 2 + (e[13] - cy) ** 2 + (e[14] - cz) ** 2;
+      };
+      list.sort((a, b) => (a.castShadow === b.castShadow ? dist(a) - dist(b) : a.castShadow ? -1 : 1));
+    }
+    if (list.length > MAX_LIGHTS) list.length = MAX_LIGHTS;
+  }
+
   private renderDepthPrepass(viewProj: Matrix4, withColor: boolean): void {
     const gl = this.gl;
     const st = this.state;
@@ -1218,7 +1408,7 @@ export class Renderer {
 
   // ───────────────────────────────── lights ─────────────────────────────────
 
-  private fillLights(scene: Scene, camera: PerspectiveCamera, sun: DirectionalLight | null, shadows: boolean): void {
+  private fillLights(scene: Scene, camera: PerspectiveCamera, sun: DirectionalLight | null, shadows: boolean, decalCount: number): void {
     const gl = this.gl;
     const d = this.lightData;
     d.fill(0, 0, 104);
@@ -1236,19 +1426,8 @@ export class Renderer {
       d[1] = 1;
     }
 
-    // punctual lights – keep the closest MAX_LIGHTS
-    let list = this.lights;
-    if (list.length > MAX_LIGHTS) {
-      camera.getWorldPosition(_tmp);
-      const cx = _tmp.x,
-        cy = _tmp.y,
-        cz = _tmp.z;
-      const dist = (l: Light) => {
-        const e = l.matrixWorld.elements;
-        return (e[12] - cx) ** 2 + (e[13] - cy) ** 2 + (e[14] - cz) ** 2;
-      };
-      list = list.slice().sort((a, b) => dist(a) - dist(b)).slice(0, MAX_LIGHTS);
-    }
+    // punctual lights – priority order (see sortLights), at most MAX_LIGHTS
+    const list = this.sortedLights;
     const n = list.length;
     for (let i = 0; i < n; i++) {
       const l = list[i];
@@ -1260,6 +1439,10 @@ export class Renderer {
       d[o + 4] = l.color.r * l.intensity;
       d[o + 5] = l.color.g * l.intensity;
       d[o + 6] = l.color.b * l.intensity;
+      d.fill(0, o + 8, o + 16);
+      const sLayer = this.ls.layerOf(l);
+      d[o + 13] = sLayer;                              // spot.y: first shadow-atlas layer (−1 = none)
+      d[o + 14] = l.type === 'PointLight' ? 1 : 0;     // spot.z: cube shadow
       if (l.type === 'SpotLight') {
         const sl = l as SpotLight;
         d[o + 3] = 2;
@@ -1281,6 +1464,58 @@ export class Renderer {
     d[8] = scene.environmentIntensity;
     d[9] = this.env.prefilterLevels - 1;
     d[10] = n;
+
+    // Lumina 4 block: local shadows, PCSS, micro shadowing, decals
+    d.fill(0, OFF_LOCAL, OFF_LOCAL + 12);
+    if (this.ls.active) {
+      d[OFF_LOCAL] = 1;
+      d[OFF_LOCAL + 1] = this.localShadows.softness;
+      d[OFF_LOCAL + 2] = 1 / this.ls.size;
+      d[OFF_LOCAL + 3] = this.localShadows.normalBias;
+      d.set(this.ls.matrices, OFF_LMAT);
+      d.set(this.ls.params, OFF_LPAR);
+    }
+    if (sun) {
+      d[OFF_LOCAL + 4] = sun.shadow.pcss ? 1 : 0;
+      d[OFF_LOCAL + 5] = Math.max(0, sun.shadow.penumbra);
+    }
+    d[OFF_LOCAL + 6] = clamp(this.microShadowing, 0, 1);
+    d[OFF_LOCAL + 8] = decalCount;
+    if (decalCount > 0) {
+      let decals = this.decalList;
+      if (decals.length > MAX_DECALS) {
+        camera.getWorldPosition(_tmp);
+        const cx = _tmp.x,
+          cy = _tmp.y,
+          cz = _tmp.z;
+        const dist = (x: Decal) => {
+          const e = x.matrixWorld.elements;
+          return (e[12] - cx) ** 2 + (e[13] - cy) ** 2 + (e[14] - cz) ** 2;
+        };
+        decals = decals.slice().sort((a, b) => dist(a) - dist(b));
+      }
+      for (let i = 0; i < decalCount; i++) {
+        const dc = decals[i];
+        const o = OFF_DECAL + i * 28;
+        _dm.copy(dc.matrixWorld).invert();
+        d.set(_dm.elements, o);
+        d[o + 16] = dc.color.r;
+        d[o + 17] = dc.color.g;
+        d[o + 18] = dc.color.b;
+        d[o + 19] = clamp(dc.opacity, 0, 1);
+        const kind = DECAL_KINDS.indexOf(dc.kind);
+        d[o + 20] = kind < 0 ? 0 : kind;
+        d[o + 21] = dc.roughness;
+        d[o + 22] = dc.normalStrength;
+        d[o + 23] = clamp(dc.flatten, 0, 1);
+        const m = dc.matrixWorld.elements;
+        const il = 1 / (Math.hypot(m[8], m[9], m[10]) || 1);
+        d[o + 24] = m[8] * il;
+        d[o + 25] = m[9] * il;
+        d[o + 26] = m[10] * il;
+        d[o + 27] = clamp(dc.wetness, 0, 1);
+      }
+    }
 
     if (shadows && sun) {
       const s = sun.shadow;

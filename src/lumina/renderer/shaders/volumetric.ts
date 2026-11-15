@@ -13,6 +13,8 @@ uniform sampler2D uTex0;         // full-res scene depth (bound to unit 0, see S
 // must be declared BEFORE <fog_shadow>, which samples it
 uniform sampler2DArrayShadow uShadowMap; // unit 3, see SAMPLER_UNITS
 #include <fog_shadow>
+#include <local_shadow>
+uniform vec4 uFogLocal;          // x = number of local lights evaluated, y = intensity
 uniform vec2 uInvOutSize;        // 1 / (half-res) size
 uniform float uDensity;          // extinction at base height (1/m)
 uniform float uHeightFalloff;    // 1/m
@@ -63,12 +65,38 @@ void main() {
     float density = densityAt(p);
     if (density > 1e-6) {
       float viewZ = -(uView * vec4(p, 1.0)).z;
-      float shadow = fogShadowSample(p, viewZ);
+      float shadow = uShadowInfo.y > 0.5 ? fogShadowSample(p, viewZ) : 1.0;
       float stepT = exp(-density * stepLen);
       // in-scattered sun radiance integrated over this step's transmittance drop —
       // (1 - stepT) is the fraction of light extinguished in this step, all of
       // which re-appears as scatter toward the eye (single-scattering approximation)
       vec3 inscatter = uSunColor.rgb * shadow * phase * uIntensity;
+      // point / spot lights: inverse-square falloff, cone, phase function and (when they own a shadow layer) occlusion → god rays
+      int nl = int(min(uEnvParams.z, uFogLocal.x));
+      for (int li = 0; li < 12; li++) {
+        if (li >= nl) break;
+        vec4 pt = uLights[li].posType;
+        vec4 cr = uLights[li].colorRange;
+        vec3 Lv = pt.xyz - p;
+        float d2 = dot(Lv, Lv);
+        float dist = sqrt(d2);
+        vec3 L = Lv / max(dist, 1e-4);
+        float att = 1.0 / max(d2, 0.25);
+        if (cr.w > 0.0) {
+          float r2 = d2 / (cr.w * cr.w);
+          float win = saturate(1.0 - r2 * r2);
+          att *= win * win;
+        }
+        if (pt.w > 1.5) {
+          float cd = dot(-L, uLights[li].dirAngle.xyz);
+          float sp = saturate((cd - uLights[li].dirAngle.w) * uLights[li].spot.x);
+          att *= sp * sp;
+        }
+        if (att > 1e-4) {
+          float vis = localShadowFactor(li, p, vec3(0.0), L, dist, noise * TWO_PI, 1);
+          inscatter += cr.rgb * (att * vis * phaseHG(dot(rd, L), uAnisotropy * 0.5) * uFogLocal.y * uIntensity);
+        }
+      }
       scatter += transmittance * inscatter * (1.0 - stepT);
       transmittance *= stepT;
     }

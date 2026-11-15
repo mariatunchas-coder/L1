@@ -21,8 +21,23 @@ function finish(g: Geometry, b: Builder, type: string): Geometry {
 
 const newBuilder = (): Builder => ({ p: [], n: [], uv: [], i: [] });
 
+/**
+ * UV layout of a (rounded) box. `arc(h, r, c)` is the distance (m) travelled over the surface from the face centre to the
+ * grid coordinate `c` – on the bevels it follows the quarter-circle (arc length), so the texel density stays constant
+ * and screen-space derivatives (mip selection, parallax ray march) don't blow up. `unit` = 0 → every face spans 0…1
+ * (per-face repeat); otherwise one uv unit = `unit` metres on every face (uniform density on thin walls).
+ */
+function arcLength(h: number, r: number, c: number): number {
+  if (r <= 0) return c;
+  const a = Math.abs(c);
+  const flat = h - r;
+  const s = a <= flat ? a : flat + r * (((a - flat) / r) * (Math.PI / 2));
+  return c < 0 ? -s : s;
+}
+const developed = (h: number, r: number): number => (r > 0 ? 2 * (h - r) + Math.PI * r : 2 * h);
+
 /** Shared by Box and RoundedBox: builds 6 grid faces from per-axis coordinate lists. */
-function buildBox(cx: number[], cy: number[], cz: number[], hx: number, hy: number, hz: number, radius: number): Builder {
+function buildBox(cx: number[], cy: number[], cz: number[], hx: number, hy: number, hz: number, radius: number, uvUnit = 0): Builder {
   const b = newBuilder();
   const coords: Record<string, number[]> = { x: cx, y: cy, z: cz };
   const half: Record<string, number> = { x: hx, y: hy, z: hz };
@@ -75,7 +90,11 @@ function buildBox(cx: number[], cy: number[], cz: number[], hx: number, hy: numb
         }
         b.p.push(px, py, pz);
         b.n.push(nx, ny, nz);
-        b.uv.push((cu[ix] + half[u]) / (2 * half[u]), 1 - (cv[iy] + half[vv]) / (2 * half[vv]));
+        const Su = developed(half[u], radius),
+          Sv = developed(half[vv], radius);
+        const su = (arcLength(half[u], radius, cu[ix]) + Su / 2) / (uvUnit > 0 ? uvUnit : Su);
+        const sv = (arcLength(half[vv], radius, cv[iy]) + Sv / 2) / (uvUnit > 0 ? uvUnit : Sv);
+        b.uv.push(su, 1 - sv);
       }
     }
     for (let iy = 0; iy < gY1 - 1; iy++) {
@@ -94,18 +113,24 @@ function buildBox(cx: number[], cy: number[], cz: number[], hx: number, hy: numb
 const linspace = (half: number, seg: number) => Array.from({ length: seg + 1 }, (_, i) => (i / seg) * 2 * half - half);
 
 export class BoxGeometry extends Geometry {
-  constructor(width = 1, height = 1, depth = 1, wSeg = 1, hSeg = 1, dSeg = 1) {
+  /** @param worldUV when true one uv unit = the longest box edge on *every* face (uniform texel density, see RoundedBoxGeometry) */
+  constructor(width = 1, height = 1, depth = 1, wSeg = 1, hSeg = 1, dSeg = 1, worldUV = false) {
     super();
     const hx = width / 2,
       hy = height / 2,
       hz = depth / 2;
-    finish(this, buildBox(linspace(hx, wSeg), linspace(hy, hSeg), linspace(hz, dSeg), hx, hy, hz, 0), 'BoxGeometry');
+    finish(this, buildBox(linspace(hx, wSeg), linspace(hy, hSeg), linspace(hz, dSeg), hx, hy, hz, 0, worldUV ? Math.max(width, height, depth) : 0), 'BoxGeometry');
   }
 }
 
 /** Box with real geometric bevels – catches highlights on edges like real-world objects do. */
 export class RoundedBoxGeometry extends Geometry {
-  constructor(width = 1, height = 1, depth = 1, radius = 0.08, segments = 5) {
+  /**
+   * UVs follow the *arc length* of the bevels (no stretching on the rounded edges). With `worldUV` one uv unit equals
+   * the longest box edge on every face, so a texture keeps the same scale on thin walls and big faces alike
+   * (e.g. a 24 × 6 × 0.9 m wall with `uvRepeat: [27, 27]` → 27 bricks per 24 m on the front, ~1 on the 0.9 m side).
+   */
+  constructor(width = 1, height = 1, depth = 1, radius = 0.08, segments = 5, worldUV = false) {
     super();
     const hx = width / 2,
       hy = height / 2,
@@ -118,7 +143,7 @@ export class RoundedBoxGeometry extends Geometry {
       for (let j = 0; j <= segments; j++) right.push(h - r + r * (j / segments));
       return [...left, ...right];
     };
-    finish(this, buildBox(axis(hx), axis(hy), axis(hz), hx, hy, hz, r), 'RoundedBoxGeometry');
+    finish(this, buildBox(axis(hx), axis(hy), axis(hz), hx, hy, hz, r, worldUV ? Math.max(width, height, depth) : 0), 'RoundedBoxGeometry');
   }
 }
 

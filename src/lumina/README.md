@@ -1,3 +1,55 @@
+# Lumina 4
+
+Lumina 4 pushes the engine toward Unreal-Engine-5-style rendering inside WebGL2. Every item below is implemented,
+exercised by the demo (tab **L4**) and verified headless (shader compile, zero `gl.getError()`, runtime toggling, context restore).
+
+| UE5 concept | Lumina 4 implementation | Switch |
+| --- | --- | --- |
+| **Lumen surface cache / world-space GI** | `VoxelGI`: an N³ RGBA16F volume that follows the camera (snapped to cells). Visible surfaces write their lit colour, visible free space fades, hidden / off-screen voxels keep history. SSGI rays that leave the screen continue through the volume (a red wall behind the camera still tints the floor in front) | `post.ssgi.worldCache`, `worldCacheExtent / Resolution / Strength` |
+| **Infinite bounce** | The GI-lit frame is kept (ping-pong) and read back by the next frame's trace (velocity-reprojected). Gain is clamped to `0.9 / intensity` so the feedback always converges | `post.ssgi.multiBounce` |
+| **Virtual shadow maps / PCSS** | Blocker search through a second, comparison-free sampler (sampler object) on the cascade array; penumbra ∝ blocker→receiver distance, contact-sharp shadows; early-out when nothing blocks | `sun.shadow.pcss`, `sun.shadow.penumbra` |
+| **Local-light shadows** | `LocalShadows` atlas (8 depth layers): spot = 1 layer, point = 6 cube faces, closest casters win; PCF with normal-offset + slope bias | `light.castShadow`, `renderer.localShadows` |
+| **Froxel-style local light volumetrics** | `volumetricFrag` integrates up to 12 point / spot lights (inverse square, cone, HG phase, atlas shadow) → god rays from lamps | `post.volumetricFog.localLights` |
+| **Micro-shadowing + horizon occlusion** | AO-driven grazing-light shadowing; specular horizon occlusion for bumpy normals | `renderer.microShadowing` |
+| **Detail maps** | Tiling micro normal + roughness (fingerprints, scratches) + grime, distance faded, RNM-blended | `material.detailMap`, `createDetailMap()` |
+| **Substrate-like layers** | Dust on up-facing surfaces, water film that fills cavities first (darker, glossier, flattened normals) | `material.wetness`, `dust`, `layers` |
+| **Decals** | `Decal` (dirt, crack, puddle, scorch, moss, scratches; procedural atlas) evaluated *inside* the material shader → lit / shadowed / reflected like the surface. Closest 8 are used | `new Decal('crack', 3)`, `decal.placeOnSurface()`, `renderer.decalsEnabled` |
+| **Physical camera / eye adaptation** | 64-bin luminance histogram (additive point scatter), centre-weighted, percentile clipping (sparks / voids ignored), EV compensation, cos⁴ optical vignette, energy-conserving bloom | `post.autoExposureMode`, `autoExposureCenterWeight`, `exposureCompensation`, `opticalVignette`, `bloom.energyConserving` |
+
+## Fixes
+
+* **RoundedBox / Box UVs** – bevels use *arc length*; `worldUV` makes one uv unit = the longest edge on every face, so a
+  thin wall no longer stretches the texture on its sides (`new RoundedBoxGeometry(24, 6, 0.9, 0.05, 2, true)` with `uvRepeat: [27, 27]`).
+  Uniform density also keeps `dFdx / dFdy` calm for the POM ray march.
+* **Normal map + POM** – the height-field normal is combined with the normal map via Reoriented Normal Mapping
+  (`material.parallaxNormalBlend`, default 0.5; 0 = old "normal map only" behaviour).
+* **Multi-bounce SSGI** – see above.
+* **Parallax self-shadow** now also works toward the 3 brightest local lights (`material.parallaxLocalShadow`).
+* **Mobile** – `detectDevice()` / `renderer.device` classify the GPU (Adreno / Mali / PowerVR / software …). `Renderer` defaults to MSAA 0 / 2 / 4 and a pixel-ratio cap by tier,
+  `applyDeviceQuality(renderer, sun)` picks the preset + dynamic resolution, and the demo scales primitive segments and instance counts by `device.geometryDetail`.
+* Lights: stale `spot` data of point lights is cleared every frame; lights are ordered shadow-casters-first, then by distance.
+
+```ts
+import { Renderer, Decal, PBRMaterial, createBricks, createDetailMap, applyDeviceQuality } from './lumina';
+
+const renderer = new Renderer({ canvas });                // tier-aware defaults
+applyDeviceQuality(renderer, sun);                        // phones: lighter preset automatically
+
+spot.castShadow = true;                                   // shadow atlas + god rays
+renderer.post.ssgi.enabled = true;                        // multi-bounce + world cache are on by default
+renderer.post.volumetricFog.enabled = true;
+
+const wall = new PBRMaterial({ ...createBricks(), detailMap: createDetailMap(), wetness: 0.3, dust: 0.1, layers: true });
+const crack = new Decal('crack', 3.4);
+crack.placeOnSurface(hitPoint, hitNormal);                // projects onto any PBR surface inside the box
+scene.add(crack);
+```
+
+Limits: the radiance cache is coarse (≈1 m cells by default) and only knows what the camera has seen; decals are not written to the
+G-buffer (SSR / SSGI albedo ignore them); a point light with a shadow uses 6 of the 8 atlas layers; large instanced fields do not cast local-light shadows.
+
+---
+
 # Lumina 3
 
 Lumina 3 adds the three "next-gen" screen-space features of modern game engines on top of Lumina 2.

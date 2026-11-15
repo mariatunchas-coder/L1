@@ -1,9 +1,11 @@
 import type { PerspectiveCamera } from '../core/Camera';
-import { GLState, TEX_2D, TEX_2D_ARRAY } from './GLState';
+import { Vector3 } from '../math/Vector3';
+import { GLState, TEX_2D, TEX_2D_ARRAY, TEX_3D } from './GLState';
+import { VoxelGI } from './VoxelGI';
 import { Program } from './Program';
 import { ColorTarget, GBufferTarget, createColorTarget, deleteColorTarget } from './RenderTarget';
 import { fullscreenVert } from './shaders/ibl';
-import { adaptFrag, bloomDownFrag, bloomUpFrag, compositeFrag, lensFlareFrag, lumFrag, ssaoBlurFrag, ssaoFrag } from './shaders/post';
+import { adaptFrag, bloomDownFrag, bloomUpFrag, compositeFrag, histAdaptFrag, histFrag, histVert, lensFlareFrag, lumFrag, ssaoBlurFrag, ssaoFrag } from './shaders/post';
 import { volumetricBlurFrag, volumetricFrag } from './shaders/volumetric';
 import { dofFrag, motionBlurFrag, ssgiApplyFrag, ssgiBlurFrag, ssgiTemporalFrag, ssgiTraceFrag, ssrApplyFrag, ssrTraceFrag, taaFrag } from './shaders/effects';
 import { TEX_CUBE } from './GLState';
@@ -17,10 +19,21 @@ export interface PostSettings {
   autoExposureKey: number;
   autoExposureMin: number;
   autoExposureMax: number;
+  /** 'histogram' = 64-bin luminance histogram with percentile clipping (ignores sparks and voids); 'average' = log-average. */
+  autoExposureMode: 'histogram' | 'average';
+  /** 0 … 1 – centre-weighted metering (0 = whole frame). */
+  autoExposureCenterWeight: number;
+  /** Histogram percentiles (0 … 1) between which the luminance is averaged. */
+  autoExposureLowPercent: number;
+  autoExposureHighPercent: number;
+  /** Exposure compensation in stops (EV). */
+  exposureCompensation: number;
+  /** Natural cos⁴ light fall-off of a real lens (0 = off, 1 = full). */
+  opticalVignette: number;
   adaptSpeedUp: number;
   adaptSpeedDown: number;
   toneMapping: ToneMapping;
-  bloom: { enabled: boolean; intensity: number; threshold: number; knee: number; radius: number };
+  bloom: { enabled: boolean; intensity: number; threshold: number; knee: number; radius: number; /** physically plausible: bloom redistributes energy instead of adding it */ energyConserving: boolean };
   ssao: { enabled: boolean; radius: number; intensity: number; power: number; bias: number };
   vignette: number;
   grain: number;
@@ -85,6 +98,16 @@ export interface PostSettings {
     maxRadiance: number;
     /** Show only the bounce light. */
     debug: boolean;
+    /** Feeds the GI-lit frame back into the trace (light bounces many times: corners fill with indirect light). */
+    multiBounce: boolean;
+    /** World-space radiance cache: rays that leave the screen read it instead of the sky fallback. */
+    worldCache: boolean;
+    /** Edge length (m) of the cache volume that follows the camera. */
+    worldCacheExtent: number;
+    /** Voxels per axis (16 – 64, even). */
+    worldCacheResolution: number;
+    /** Strength of the off-screen bounce light. */
+    worldCacheStrength: number;
   };
   /** Refraction of glass / liquids (`transmission > 0`). */
   refraction: {
@@ -121,6 +144,9 @@ export interface PostSettings {
     intensity: number;
     maxDistance: number;
     steps: number;
+    /** Point / spot lights scatter in the fog too (god rays; shadowed when the light casts shadows). */
+    localLights: boolean;
+    localIntensity: number;
   };
 }
 
@@ -131,10 +157,16 @@ export function defaultPostSettings(): PostSettings {
     autoExposureKey: 0.18,
     autoExposureMin: 0.05,
     autoExposureMax: 20,
+    autoExposureMode: 'histogram',
+    autoExposureCenterWeight: 0.6,
+    autoExposureLowPercent: 0.1,
+    autoExposureHighPercent: 0.94,
+    exposureCompensation: 0,
+    opticalVignette: 0,
     adaptSpeedUp: 2.5,
     adaptSpeedDown: 1.2,
     toneMapping: 'aces',
-    bloom: { enabled: true, intensity: 0.12, threshold: 1.2, knee: 0.6, radius: 0.72 },
+    bloom: { enabled: true, intensity: 0.12, threshold: 1.2, knee: 0.6, radius: 0.72, energyConserving: false },
     ssao: { enabled: true, radius: 0.7, intensity: 1.25, power: 1.35, bias: 0.03 },
     vignette: 0.28,
     grain: 0.08,
@@ -149,7 +181,7 @@ export function defaultPostSettings(): PostSettings {
     contactShadows: { enabled: false, length: 0.7, thickness: 0.5, strength: 0.85 },
     taa: { enabled: false, feedback: 0.9, jitter: 1 },
     ssr: { enabled: false, intensity: 1, maxDistance: 40, thickness: 0.6, maxRoughness: 0.6, steps: 64 },
-    ssgi: { enabled: false, intensity: 1, radius: 6, thickness: 0.6, rays: 2, steps: 16, feedback: 0.92, blur: 3, maxRadiance: 12, debug: false },
+    ssgi: { enabled: false, intensity: 1, radius: 6, thickness: 0.6, rays: 2, steps: 16, feedback: 0.92, blur: 3, maxRadiance: 12, debug: false, multiBounce: true, worldCache: true, worldCacheExtent: 40, worldCacheResolution: 32, worldCacheStrength: 1 },
     refraction: { screenSpace: true, steps: 24, maxDistance: 14, thickness: 1.2, bend: 0.4 },
     dof: { enabled: false, focusDistance: 12, focalLength: 50, fStop: 2.8, maxBlur: 12, taps: 28 },
     motionBlur: { enabled: false, intensity: 0.5, samples: 12 },
@@ -162,10 +194,14 @@ export function defaultPostSettings(): PostSettings {
       intensity: 1,
       maxDistance: 120,
       steps: 24,
+      localLights: true,
+      localIntensity: 1,
     },
   };
 }
 
+const HIST_MIN_EV = -10;
+const HIST_MAX_EV = 14;
 const TONE_ID: Record<ToneMapping, number> = { none: 0, reinhard: 1, aces: 2, neutral: 3, filmic: 4, agx: 5 };
 
 /** Screen-space effects: SSAO, bloom, auto-exposure, tone mapping & grading. */
@@ -196,6 +232,14 @@ export class PostProcessor {
   private giHist: ColorTarget[] = [];
   private giIdx = 0;
   private giValid = false;
+  /** full-resolution GI-lit frames (ping-pong): the previous one is read back by the trace → multi-bounce */
+  private giFull: ColorTarget[] = [];
+  private giFullIdx = 0;
+  private giFullValid = false;
+  private voxel: VoxelGI | null = null;
+  private histProg: Program;
+  private histAdaptProg: Program;
+  private hist: ColorTarget;
 
   // lazily created full-frame targets for the G-buffer driven effects
   private fx: ColorTarget[] = [];
@@ -240,6 +284,9 @@ export class PostProcessor {
     this.giTemporalProg = mk(ssgiTemporalFrag, 'ssgiTemporal');
     this.giBlurProg = mk(ssgiBlurFrag, 'ssgiBlur');
     this.giApplyProg = mk(ssgiApplyFrag, 'ssgiApply');
+    this.histProg = new Program(gl, state, histVert, histFrag, [], 'histogram').finalize();
+    this.histAdaptProg = mk(histAdaptFrag, 'histogramAdapt');
+    this.hist = createColorTarget(gl, state, 64, 1, gl.RGBA16F, { filter: 'nearest' });
     this.lum = createColorTarget(gl, state, this.lumSize, this.lumSize, gl.RGBA16F, { mipmaps: true });
     this.adapt = [createColorTarget(gl, state, 1, 1, gl.R16F), createColorTarget(gl, state, 1, 1, gl.R16F)];
   }
@@ -249,10 +296,12 @@ export class PostProcessor {
     const gl = this.gl;
     this.width = w;
     this.height = h;
-    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, this.giTrace, this.giOut, ...this.giHist, ...this.fx, ...this.taaHist, ...this.down, ...this.up])
+    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, this.giTrace, this.giOut, ...this.giHist, ...this.giFull, ...this.fx, ...this.taaHist, ...this.down, ...this.up])
       deleteColorTarget(gl, this.state, t);
     this.giTrace = this.giOut = null;
     this.giHist = [];
+    this.giFull = [];
+    this.giFullValid = false;
     this.giValid = false;
     this.flareRT = null;
     this.fx = [];
@@ -340,8 +389,10 @@ export class PostProcessor {
   renderVolumetricFog(
     depthTex: WebGLTexture,
     shadowTex: WebGLTexture,
+    localShadowTex: WebGLTexture,
     camera: PerspectiveCamera,
     s: PostSettings['volumetricFog'],
+    localLights: number,
     fullW: number,
     fullH: number
   ): WebGLTexture {
@@ -354,6 +405,8 @@ export class PostProcessor {
     const L = this.volumetricProg.loc;
     this.state.bindTexture(0, TEX_2D, depthTex);
     this.state.bindTexture(3, TEX_2D_ARRAY, shadowTex);
+    this.state.bindTexture(14, TEX_2D_ARRAY, localShadowTex);
+    gl.uniform4f(L.uFogLocal, localLights, Math.max(0, s.localIntensity), 0, 0);
     gl.uniform2f(L.uInvOutSize, 1 / a.width, 1 / a.height);
     gl.uniform1f(L.uDensity, s.density);
     gl.uniform1f(L.uHeightFalloff, s.heightFalloff);
@@ -429,7 +482,40 @@ export class PostProcessor {
   /** Measures scene luminance on the GPU and adapts exposure smoothly – no CPU read-back. */
   updateAutoExposure(sceneTex: WebGLTexture, w: number, h: number, dt: number, s: PostSettings): void {
     const gl = this.gl;
+    const st = this.state;
     this.begin();
+    const prev = this.adapt[this.adaptIndex];
+    const next = this.adapt[1 - this.adaptIndex];
+    if (s.autoExposureMode === 'histogram') {
+      // 1. scatter a centre-weighted 48×48 sample grid into 64 EV bins (additive points)
+      const N = 48;
+      st.bindFramebuffer(this.hist.fbo);
+      st.setViewport(0, 0, 64, 1);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      st.setBlend(2);
+      this.histProg.use();
+      st.bindTexture(0, TEX_2D, sceneTex);
+      gl.uniform4f(this.histProg.loc.uHist, N, HIST_MIN_EV, HIST_MAX_EV, Math.max(0, Math.min(1, s.autoExposureCenterWeight)));
+      gl.uniform2f(this.histProg.loc.uStepUv, 1 / N, 1 / N);
+      gl.drawArrays(gl.POINTS, 0, N * N);
+      st.setBlend(0);
+      // 2. percentile-clipped average + temporal adaptation
+      this.histAdaptProg.use();
+      const HL = this.histAdaptProg.loc;
+      st.bindTexture(0, TEX_2D, this.hist.texture);
+      st.bindTexture(1, TEX_2D, prev.texture);
+      gl.uniform1f(HL.uDt, dt);
+      gl.uniform1f(HL.uSpeedUp, s.adaptSpeedUp);
+      gl.uniform1f(HL.uSpeedDown, s.adaptSpeedDown);
+      gl.uniform1f(HL.uFirst, this.adaptFirst ? 1 : 0);
+      const lo = Math.max(0, Math.min(0.95, s.autoExposureLowPercent));
+      gl.uniform4f(HL.uHistP, HIST_MIN_EV, HIST_MAX_EV, lo, Math.max(lo + 0.02, Math.min(1, s.autoExposureHighPercent)));
+      this.pass(next, w, h);
+      this.adaptIndex = 1 - this.adaptIndex;
+      this.adaptFirst = false;
+      return;
+    }
     this.lumProg.use();
     this.state.bindTexture(0, TEX_2D, sceneTex);
     gl.uniform2f(this.lumProg.loc.uTexel, 1 / w, 1 / h);
@@ -438,8 +524,6 @@ export class PostProcessor {
     this.state.bindScratch(TEX_2D, this.lum.texture);
     gl.generateMipmap(gl.TEXTURE_2D);
 
-    const prev = this.adapt[this.adaptIndex];
-    const next = this.adapt[1 - this.adaptIndex];
     this.adaptProg.use();
     const L = this.adaptProg.loc;
     this.state.bindTexture(0, TEX_2D, this.lum.texture);
@@ -457,6 +541,8 @@ export class PostProcessor {
   /** Drops the SSGI history (call when the effect was not rendered, or after a camera cut). */
   resetGI(): void {
     this.giValid = false;
+    this.giFullValid = false;
+    this.voxel?.reset();
   }
 
   private ensureGI(): void {
@@ -467,7 +553,11 @@ export class PostProcessor {
     this.giTrace = createColorTarget(gl, this.state, aw, ah, gl.RGBA16F, { filter: 'nearest' });
     this.giOut = createColorTarget(gl, this.state, aw, ah, gl.RGBA16F, { filter: 'nearest' });
     this.giHist = [0, 1].map(() => createColorTarget(gl, this.state, aw, ah, gl.RGBA16F));
+    this.giFull = [0, 1].map(() => createColorTarget(gl, this.state, this.width, this.height, gl.RGBA16F));
+    this.giFullIdx = 0;
+    this.giFullValid = false;
     this.giValid = false;
+    if (!this.voxel) this.voxel = new VoxelGI(gl, this.state);
   }
 
   /**
@@ -475,9 +565,16 @@ export class PostProcessor {
    * Pipeline: half-res trace → temporal accumulation (history is reprojected with the velocity buffer) →
    * depth/normal-aware blur → full-res bilateral upsample multiplied by the G-buffer albedo.
    */
-  renderSSGI(sceneTex: WebGLTexture, gb: GBufferTarget, s: PostSettings['ssgi'], w: number, h: number, frame: number, forceReset: boolean): WebGLTexture {
+  renderSSGI(sceneTex: WebGLTexture, gb: GBufferTarget, s: PostSettings['ssgi'], w: number, h: number, frame: number, forceReset: boolean, camPos: Vector3): WebGLTexture {
     const gl = this.gl;
     this.ensureGI();
+    const voxel = this.voxel!;
+    const useCache = s.worldCache;
+    voxel.ensure(useCache ? Math.round(s.worldCacheResolution) : 4);
+    // world-space radiance cache: remembers lit surfaces the camera saw (also those that are now off-screen)
+    if (useCache) voxel.update(gb.texture, sceneTex, camPos, Math.max(4, s.worldCacheExtent), 0.2, Math.max(0.5, s.maxRadiance), forceReset);
+    const feedback = s.multiBounce && this.giFullValid && !forceReset ? Math.min(0.9, 0.9 / Math.max(1, s.intensity)) : 0;
+    const prevFull = this.giFull[1 - this.giFullIdx];
     const trace = this.giTrace!;
     const out = this.giOut!;
     const write = this.giHist[this.giIdx];
@@ -489,8 +586,12 @@ export class PostProcessor {
     this.state.bindTexture(0, TEX_2D, gb.texture);
     this.state.bindTexture(1, TEX_2D, gb.velNormal);
     this.state.bindTexture(2, TEX_2D, sceneTex);
+    this.state.bindTexture(3, TEX_2D, feedback > 0 ? prevFull.texture : sceneTex);
+    this.state.bindTexture(6, TEX_3D, voxel.texture);
+    gl.uniform4f(L.uVoxO, voxel.origin[0], voxel.origin[1], voxel.origin[2], useCache ? voxel.origin[3] : 1);
+    gl.uniform4f(L.uVoxS, voxel.size, useCache ? Math.max(0, s.worldCacheStrength) : 0, 0, 0);
     gl.uniform4f(L.uGI, Math.max(0.2, s.radius), Math.max(0.02, s.thickness), Math.max(1, Math.min(4, Math.round(s.rays))), Math.max(6, Math.min(32, Math.round(s.steps))));
-    gl.uniform4f(L.uGI2, frame % 4096, Math.max(0.5, s.maxRadiance), 0, 0);
+    gl.uniform4f(L.uGI2, frame % 4096, Math.max(0.5, s.maxRadiance), feedback, 0);
     this.pass(trace, w, h);
 
     this.giTemporalProg.use();
@@ -515,7 +616,7 @@ export class PostProcessor {
       giTex = out.texture;
     }
 
-    const dst = this.pickFx(sceneTex);
+    const dst = this.giFull[this.giFullIdx];
     this.giApplyProg.use();
     this.state.bindTexture(0, TEX_2D, sceneTex);
     this.state.bindTexture(1, TEX_2D, giTex);
@@ -523,6 +624,8 @@ export class PostProcessor {
     this.state.bindTexture(3, TEX_2D, gb.texture);
     gl.uniform4f(this.giApplyProg.loc.uGIA, Math.max(0, s.intensity), s.debug ? 1 : 0, 0, 0);
     this.pass(dst, w, h);
+    this.giFullIdx = 1 - this.giFullIdx;
+    this.giFullValid = true;
     return dst.texture;
   }
 
@@ -666,6 +769,7 @@ export class PostProcessor {
     gl.uniform2f(L.uParams4, Math.max(0, s.sharpen), Math.max(-1, Math.min(1, s.temperature)));
     gl.uniform1f(L.uFogEnabled, fogTex && s.volumetricFog.enabled ? 1 : 0);
     gl.uniform4f(L.uParams5, flareTex && s.lensFlare.enabled ? Math.max(0, s.lensFlare.intensity) : 0, s.lensDistortion, s.cdl.enabled ? 1 : 0, 0);
+    gl.uniform4f(L.uParams6, Math.max(0, Math.min(1, s.opticalVignette)), s.bloom.energyConserving ? 1 : 0, s.exposureCompensation, 0);
     gl.uniform3f(L.uSlope, s.cdl.slope[0], s.cdl.slope[1], s.cdl.slope[2]);
     gl.uniform3f(L.uOffset, s.cdl.offset[0], s.cdl.offset[1], s.cdl.offset[2]);
     gl.uniform3f(L.uPower, Math.max(0.05, s.cdl.power[0]), Math.max(0.05, s.cdl.power[1]), Math.max(0.05, s.cdl.power[2]));
@@ -674,8 +778,9 @@ export class PostProcessor {
 
   dispose(): void {
     const gl = this.gl;
-    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, this.lum, this.giTrace, this.giOut, ...this.giHist, ...this.fx, ...this.taaHist, ...this.adapt, ...this.down, ...this.up])
+    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, this.lum, this.giTrace, this.giOut, ...this.giHist, ...this.giFull, this.hist, ...this.fx, ...this.taaHist, ...this.adapt, ...this.down, ...this.up])
       deleteColorTarget(gl, this.state, t);
+    this.voxel?.dispose();
     for (const p of [
       this.ssaoProg,
       this.ssaoBlurProg,
@@ -697,6 +802,8 @@ export class PostProcessor {
       this.giTemporalProg,
       this.giBlurProg,
       this.giApplyProg,
+      this.histProg,
+      this.histAdaptProg,
     ])
       p.dispose();
   }

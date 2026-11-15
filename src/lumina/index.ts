@@ -1,6 +1,9 @@
 /**
  * Lumina – a performance-first, physically based WebGL2 rendering engine.
  *
+ * Lumina 4: world-space radiance cache + multi-bounce SSGI, PCSS soft shadows, spot / point light shadow atlas,
+ * local-light volumetric god rays, histogram eye adaptation, detail maps, wet / dust layers, projected decals,
+ * normal-map ⊕ parallax blending (RNM), arc-length UVs, automatic mobile optimisation.
  * Features: PBR + IBL (sheen, anisotropy, iridescence, subsurface, refraction/transmission with dispersion, water),
  * parallax occlusion mapping, screen-space global illumination (SSGI),
  * cascaded + contact shadows, SSAO, SSR, TAA, DoF, motion blur, volumetric fog, procedural clouds,
@@ -25,6 +28,8 @@ export { Material, PBRMaterial, WaterMaterial, UnlitMaterial, FrontSide, BackSid
 export type { PBRMaterialParams } from './core/Material';
 export { Texture } from './core/Texture';
 export { Light, DirectionalLight, PointLight, SpotLight } from './core/Lights';
+export { Decal, DECAL_KINDS } from './core/Decal';
+export type { DecalKind } from './core/Decal';
 export type { CascadedShadowSettings } from './core/Lights';
 export { Sky, Fog } from './core/Sky';
 export { Raycaster } from './core/Raycaster';
@@ -45,7 +50,11 @@ export type { RendererOptions, RenderInfo } from './renderer/Renderer';
 export { defaultPostSettings } from './renderer/PostProcessor';
 export type { PostSettings, ToneMapping } from './renderer/PostProcessor';
 export { OrbitControls } from './controls/OrbitControls';
-export { applyQuality, AdaptiveQuality, QUALITY_LEVELS } from './quality/Quality';
+export { applyQuality, applyDeviceQuality, AdaptiveQuality, QUALITY_LEVELS } from './quality/Quality';
+export { detectDevice } from './quality/Device';
+export type { DeviceProfile } from './quality/Device';
+export { createDetailMap } from './textures/Detail';
+export type { LocalShadowSettings } from './renderer/LocalShadows';
 export type { QualityLevel } from './quality/Quality';
 export { mergeGeometries } from './util/Merge';
 export type { MergeItem } from './util/Merge';

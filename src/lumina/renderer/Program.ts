@@ -18,6 +18,14 @@ export const SAMPLER_UNITS: Record<string, number> = {
   uSceneDepth: 12,
   /** parallax occlusion height field – main pass only */
   uHeightMap: 13,
+  /** Lumina 4 – main pass: tiling detail map, decal atlas, local-light shadow atlas, raw (non-comparison) cascade depth for PCSS */
+  uDetailMap: 9,
+  uDecalTex: 10,
+  uLocalShadow: 14,
+  uShadowRaw: 15,
+  /** world-space radiance cache (post passes only) */
+  uVox: 6,
+  uVoxHist: 6,
   // generic post-processing inputs
   uTex0: 0,
   uTex1: 1,
@@ -41,6 +49,7 @@ precision highp samplerCube;
 precision highp sampler2DArray;
 precision highp sampler2DShadow;
 precision highp sampler2DArrayShadow;
+precision highp sampler3D;
 `;
 
 function resolve(src: string): string {

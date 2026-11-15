@@ -5,6 +5,11 @@ import {
   Clock,
   Color,
   CylinderGeometry,
+  Decal,
+  type DecalKind,
+  type DeviceProfile,
+  applyDeviceQuality,
+  createDetailMap,
   DirectionalLight,
   Fog,
   GLTFLoader,
@@ -96,7 +101,20 @@ export interface Showcase {
   playClip(index: number): void;
   setClipSpeed(s: number): void;
   screenshot(): Promise<Blob>;
-  setCameraPreset(p: 'default' | 'top' | 'front' | 'low' | 'close' | 'relief' | 'glass' | 'gi'): void;
+  setCameraPreset(p: 'default' | 'top' | 'front' | 'low' | 'close' | 'relief' | 'glass' | 'gi' | 'decals' | 'wet'): void;
+  /** Detected GPU class (mobile / low-end GPUs get lighter geometry and presets automatically). */
+  device: DeviceProfile;
+  /** Projected decals placed in the demo scene. */
+  decals: Decal[];
+  /** The shadow-casting spot light and neon point light (volumetric god rays + local shadow atlas). */
+  spot: SpotLight;
+  neonLight: PointLight;
+  /** Water film + dust on every layered demo material. */
+  setSurfaceLayers(wetness: number, dust: number): void;
+  /** Detail map strength on the relief materials (0 = off). */
+  setDetail(normal: number, roughness: number, tiling: number): void;
+  setPomBlend(normalBlend: number, localShadow: boolean): void;
+  setDecalsVisible(v: boolean): void;
   /** Global control of every parallax-mapped demo material (relief depth multiplier, self-shadow, cavity AO, max steps). */
   setParallax(depthScale: number, selfShadow: number, cavityAO: number, maxSteps: number): void;
   /** Dispersion strength of the demo glass objects. */
@@ -119,7 +137,10 @@ export async function createShowcase(
   onProgress: (p: number, label: string) => void = () => {}
 ): Promise<Showcase> {
   const envRes = Number(new URLSearchParams(location.search).get('env')) || 256;
-  const renderer = new Renderer({ canvas, samples: 4, environmentResolution: envRes });
+  const renderer = new Renderer({ canvas, environmentResolution: envRes });
+  // phones / weak GPUs: fewer geometry segments and instances (3 M triangles + 4× MSAA + SSGI = ~15 fps on an Adreno 610)
+  const detailLevel = renderer.device.geometryDetail;
+  const seg = (n: number, min = 8) => Math.max(min, Math.round(n * detailLevel));
   const scene = new Scene();
   const camera = new PerspectiveCamera(42, 1, 0.1, 3500);
   camera.position.set(15, 5.2, 23);
@@ -137,6 +158,7 @@ export async function createShowcase(
   sun.shadow.mapSize = 2048;
   sun.syncWithSky(sky);
   scene.add(sun);
+  applyDeviceQuality(renderer, sun);
 
   // ── procedural PBR texture sets ──
   onProgress(0.05, 'Membuat tekstur PBR prosedural…');
@@ -162,8 +184,12 @@ export async function createShowcase(
 
   // every material that uses parallax occlusion mapping (base relief depth in metres) – driven from the UI
   const pomMats: { m: PBRMaterial; base: number }[] = [];
+  // Lumina 4: every relief material also gets a tiling detail map and the wet / dust layer
+  const detailTex = createDetailMap(256);
   const pom = (m: PBRMaterial, depth: number): PBRMaterial => {
     m.parallaxScale = depth;
+    m.detailMap = detailTex;
+    m.layers = true;
     pomMats.push({ m, base: depth });
     return m;
   };
@@ -181,8 +207,8 @@ export async function createShowcase(
 
   // ── marble platform ──
   const platform = new Mesh(
-    new RoundedBoxGeometry(34, 0.6, 30, 0.06, 3),
-    pom(new PBRMaterial({ ...marble, uvRepeat: [8.5, 7.5], roughness: 1, name: 'Marmer' }), 0.018)
+    new RoundedBoxGeometry(34, 0.6, 30, 0.06, 3, true),
+    pom(new PBRMaterial({ ...marble, uvRepeat: [8.5, 8.5], roughness: 1, name: 'Marmer', wetness: 0.002 }), 0.018)
   );
   platform.name = 'Panggung marmer';
   platform.position.set(0, 0, 0);
@@ -190,15 +216,15 @@ export async function createShowcase(
 
   // ── brick wall ──
   const wall = new Mesh(
-    new RoundedBoxGeometry(24, 6, 0.9, 0.05, 2),
-    pom(new PBRMaterial({ ...bricks, uvRepeat: [27, 6.8], roughness: 1, normalScale: 1.1, name: 'Bata' }), 0.03)
+    new RoundedBoxGeometry(24, 6, 0.9, 0.05, 2, true),
+    pom(new PBRMaterial({ ...bricks, uvRepeat: [27, 27], roughness: 1, normalScale: 1.1, name: 'Bata', detailScale: 22 }), 0.03)
   );
   wall.name = 'Dinding bata';
   wall.position.set(0, FLOOR_Y + 3, -11);
   scene.add(wall);
 
   // ── material spheres: metal (gold) and dielectric (red plastic) sweeping roughness ──
-  const sphereGeo = new SphereGeometry(0.72, 96, 48);
+  const sphereGeo = new SphereGeometry(0.72, seg(96), seg(48));
   const gold = lin(1.0, 0.71, 0.29);
   for (let i = 0; i < 7; i++) {
     const r = i / 6;
@@ -217,8 +243,8 @@ export async function createShowcase(
   const carMat = new PBRMaterial({ color: lin(0.5, 0.012, 0.02), metalness: 0.55, roughness: 0.38, clearcoat: 1, clearcoatRoughness: 0.025, name: 'Cat mobil' });
   // LOD: detailed sphere up close, a cheap one far away (switches with hysteresis)
   const carPaint = new LOD();
-  const carHi = new Mesh(new SphereGeometry(1.5, 128, 64), carMat);
-  const carLo = new Mesh(new SphereGeometry(1.5, 32, 16), carMat);
+  const carHi = new Mesh(new SphereGeometry(1.5, seg(128), seg(64)), carMat);
+  const carLo = new Mesh(new SphereGeometry(1.5, seg(32, 12), seg(16, 8)), carMat);
   carHi.name = carLo.name = 'Cat mobil (clear-coat)';
   carPaint.addLevel(carHi, 0);
   carPaint.addLevel(carLo, 70);
@@ -227,12 +253,12 @@ export async function createShowcase(
 
   // ── wooden pedestal + brushed copper torus knot ──
   const woodMat = pom(new PBRMaterial({ ...wood, uvRepeat: [3, 1.2], roughness: 1, clearcoat: 0.6, clearcoatRoughness: 0.2, name: 'Kayu' }), 0.02);
-  const ped1 = new Mesh(new CylinderGeometry(1.9, 2.05, 0.9, 64), woodMat);
+  const ped1 = new Mesh(new CylinderGeometry(1.9, 2.05, 0.9, seg(64, 16)), woodMat);
   ped1.name = 'Alas kayu';
   ped1.position.set(-7.2, FLOOR_Y + 0.45, -3.2);
   scene.add(ped1);
   const knot = new Mesh(
-    new TorusKnotGeometry(0.85, 0.27, 360, 48, 2, 3),
+    new TorusKnotGeometry(0.85, 0.27, seg(360, 64), seg(48, 10), 2, 3),
     new PBRMaterial({ ...brushed, heightMap: null, color: lin(0.955, 0.638, 0.538), roughness: 1, metalness: 1, clearcoat: 0.35, clearcoatRoughness: 0.08, name: 'Tembaga' })
   );
   knot.name = 'Torus knot tembaga';
@@ -240,16 +266,16 @@ export async function createShowcase(
   scene.add(knot);
 
   // ── glass sphere on pedestal (real refraction through the transmission pass) ──
-  const ped2 = new Mesh(new CylinderGeometry(1.9, 2.05, 0.9, 64), woodMat);
+  const ped2 = new Mesh(new CylinderGeometry(1.9, 2.05, 0.9, seg(64, 16)), woodMat);
   ped2.name = 'Alas kayu';
   ped2.position.set(7.2, FLOOR_Y + 0.45, -3.2);
   scene.add(ped2);
-  const inner = new Mesh(new SphereGeometry(0.45, 64, 32), new PBRMaterial({ color: gold, metalness: 1, roughness: 0.18 }));
+  const inner = new Mesh(new SphereGeometry(0.45, seg(64, 16), seg(32, 8)), new PBRMaterial({ color: gold, metalness: 1, roughness: 0.18 }));
   inner.name = 'Bola emas dalam kaca';
   inner.position.set(7.2, FLOOR_Y + 0.9 + 1.25, -3.2);
   scene.add(inner);
   const glass = new Mesh(
-    new SphereGeometry(1.25, 128, 64),
+    new SphereGeometry(1.25, seg(128), seg(64)),
     new PBRMaterial({ color: lin(0.96, 0.99, 1.0), metalness: 0, roughness: 0.02, transmission: 1, ior: 1.5, thickness: 1.1, attenuationColor: lin(0.86, 0.97, 0.93), attenuationDistance: 7, name: 'Kaca', dispersion: 0.8 })
   );
   glassMats.push({ m: glass.material as PBRMaterial, k: 0.2 });
@@ -260,7 +286,7 @@ export async function createShowcase(
 
   // ── concrete pillars (long cascaded shadows) ──
   const concreteMat = pom(new PBRMaterial({ ...concrete, uvRepeat: [3, 6], roughness: 1, name: 'Beton' }), 0.025);
-  const pillarGeo = new CylinderGeometry(0.7, 0.7, 11, 48);
+  const pillarGeo = new CylinderGeometry(0.7, 0.7, 11, seg(48, 12));
   for (const [x, z] of [
     [-14.5, 9],
     [14.5, 9],
@@ -279,13 +305,14 @@ export async function createShowcase(
 
   // ── emissive neon ring + its light ──
   const neonMat = new PBRMaterial({ color: new Color(0, 0, 0), emissive: lin(1.0, 0.32, 0.06), emissiveIntensity: 14, roughness: 0.4, name: 'Neon' });
-  const neon = new Mesh(new TorusGeometry(2.4, 0.07, 24, 160), neonMat);
+  const neon = new Mesh(new TorusGeometry(2.4, 0.07, seg(24, 8), seg(160, 48)), neonMat);
   neon.name = 'Cincin neon';
   neon.position.set(0, FLOOR_Y + 3.4, -10.35);
   neon.castShadow = false;
   scene.add(neon);
   const neonLight = new PointLight(lin(1.0, 0.4, 0.12), 90, 16);
   neonLight.position.set(0, FLOOR_Y + 3.4, -8.8);
+  neonLight.castShadow = true; // 6-face cube shadow in the local shadow atlas
   scene.add(neonLight);
 
   const blueLight = new PointLight(lin(0.25, 0.5, 1.0), 40, 14);
@@ -301,10 +328,11 @@ export async function createShowcase(
   spot.penumbra = 0.55;
   spot.position.set(0, 9, 3);
   spot.target.set(0, FLOOR_Y + 1.5, -3.6);
+  spot.castShadow = true;
   scene.add(spot);
 
   // ── thousands of instanced rounded boxes: one draw call ──
-  const MAX = 200000;
+  const MAX = Math.max(20000, Math.round(200000 * Math.min(1, detailLevel * 1.5)));
   const boxGeo = new RoundedBoxGeometry(1, 1, 1, 0.1, 2);
   const stressMat = new PBRMaterial({ color: lin(1, 1, 1), roughness: 0.55, metalness: 0.0, name: 'Instance' });
   const stress = new InstancedMesh(boxGeo, stressMat, MAX, true);
@@ -358,7 +386,7 @@ export async function createShowcase(
 
   // ── photoreal material row: sheen · anisotropy · iridescence · thin-film bubble · subsurface ──
   const rowZ = 11.6;
-  const rowGeo = new SphereGeometry(0.9, 96, 48);
+  const rowGeo = new SphereGeometry(0.9, seg(96), seg(48));
   rowGeo.computeTangents();
   const rowSphere = (x: number, name: string, mat: PBRMaterial) => {
     const m = new Mesh(rowGeo, mat);
@@ -405,7 +433,7 @@ export async function createShowcase(
   poolFloor.name = 'Dasar kolam';
   poolFloor.position.set(BX, FLOOR_Y + 0.1, BZ);
   scene.add(poolFloor);
-  const bathed = new Mesh(new SphereGeometry(0.55, 64, 32), new PBRMaterial({ color: gold, metalness: 1, roughness: 0.22, name: 'Bola emas kolam' }));
+  const bathed = new Mesh(new SphereGeometry(0.55, seg(64, 16), seg(32, 8)), new PBRMaterial({ color: gold, metalness: 1, roughness: 0.22, name: 'Bola emas kolam' }));
   bathed.name = 'Bola emas (setengah terendam)';
   bathed.position.set(BX + 1.2, FLOOR_Y + 0.82, BZ - 0.3);
   scene.add(bathed);
@@ -434,7 +462,7 @@ export async function createShowcase(
   // ── dispersive glass: a thin lens in front of the neon ring and a prism ──
   const lensMat = new PBRMaterial({ color: lin(0.97, 0.99, 1), roughness: 0.01, transmission: 1, ior: 1.52, thickness: 0.7, dispersion: 4, attenuationColor: lin(0.93, 0.98, 0.97), attenuationDistance: 9, name: 'Lensa kaca' });
   glassMats.push({ m: lensMat, k: 1 });
-  const lens = new Mesh(new SphereGeometry(1.25, 96, 48), lensMat);
+  const lens = new Mesh(new SphereGeometry(1.25, seg(96), seg(48)), lensMat);
   lens.name = 'Lensa kaca (dispersi)';
   lens.scale.set(1, 1, 0.38);
   lens.position.set(0, FLOOR_Y + 5.0, -9.5);
@@ -461,13 +489,33 @@ export async function createShowcase(
     box.position.set(sx * 14.6, FLOOR_Y + 0.85, -3.2);
     box.rotation.y = 0.5;
     scene.add(box);
-    const ball = new Mesh(new SphereGeometry(0.8, 48, 24), white);
+    const ball = new Mesh(new SphereGeometry(0.8, seg(48, 12), seg(24, 8)), white);
     ball.name = 'Bola putih (GI)';
     ball.position.set(sx * 14.2, FLOOR_Y + 0.8, -0.3);
     scene.add(ball);
   };
   cornell(1, lin(0.8, 0.03, 0.03), 'Dinding merah (GI)');
   cornell(-1, lin(0.05, 0.25, 0.9), 'Dinding biru (GI)');
+
+  // ── Lumina 4: projected decals – evaluated inside the material, so they are lit, shadowed and reflected like the surface ──
+  const decals: Decal[] = [];
+  const decal = (kind: DecalKind, x: number, y: number, z: number, nx: number, ny: number, nz: number, size: number, spin = 0): Decal => {
+    const d = new Decal(kind, size, 0.6);
+    d.placeOnSurface(new Vector3(x, y, z), new Vector3(nx, ny, nz), size, 0.6, spin);
+    d.name = 'Decal · ' + kind;
+    scene.add(d);
+    decals.push(d);
+    return d;
+  };
+  const WALL_Z = -11 + 0.45;
+  decal('crack', -5.2, FLOOR_Y + 2.8, WALL_Z, 0, 0, 1, 3.4, 0.3);
+  decal('crack', 6.4, FLOOR_Y + 1.7, WALL_Z, 0, 0, 1, 2.6, -0.6);
+  decal('dirt', 1.5, FLOOR_Y + 0.7, WALL_Z, 0, 0, 1, 6, 0.9);
+  decal('moss', -8.8, FLOOR_Y + 0.55, WALL_Z, 0, 0, 1, 3.2, 0.2);
+  decal('puddle', 3.4, FLOOR_Y, 0.8, 0, 1, 0, 3.6);
+  decal('puddle', -3.6, FLOOR_Y, 1.4, 0, 1, 0, 2.4, 1);
+  decal('scorch', 4.5, FLOOR_Y, 8.2, 0, 1, 0, 3.4);
+  decal('scratches', -7, FLOOR_Y, 8.6, 0, 1, 0, 3.6, 0.4);
 
   // everything except ground / platform / sun can be hidden to give imported models a clean stage
   const props = scene.children.filter((o) => o !== ground && o !== platform && o !== sun);
@@ -596,6 +644,8 @@ export async function createShowcase(
       else if (p === 'relief') controls.setView(new Vector3(-9.7, 1.9, -7.7), 6.5, -28, 8);
       else if (p === 'glass') controls.setView(new Vector3(1.5, 4.0, -8), 11, 18, 8);
       else if (p === 'gi') controls.setView(new Vector3(14, 1.8, -2), 12, -55, 12);
+      else if (p === 'decals') controls.setView(new Vector3(0, 2.4, -10.4), 9, 0, 5);
+      else if (p === 'wet') controls.setView(new Vector3(1.5, 0.4, 1.4), 7.5, 28, 7);
       else if (p === 'low') controls.setView(t, d * 0.8, 40, 2);
       else controls.setView(t, d * 0.45, 50, 14);
       renderer.resetTemporal();
@@ -624,6 +674,33 @@ export async function createShowcase(
     maxInstances: MAX,
     water,
     adaptive,
+    device: renderer.device,
+    decals,
+    spot,
+    neonLight,
+    setSurfaceLayers(wetness, dust) {
+      for (const { m } of pomMats) {
+        m.wetness = wetness;
+        m.dust = dust;
+      }
+    },
+    setDetail(normal, roughness, tiling) {
+      for (const { m } of pomMats) {
+        m.detailMap = normal > 0 || roughness > 0 ? detailTex : null;
+        m.detailNormalScale = normal;
+        m.detailRoughness = roughness;
+        m.detailScale = tiling;
+      }
+    },
+    setPomBlend(normalBlend, localShadow) {
+      for (const { m } of pomMats) {
+        m.parallaxNormalBlend = normalBlend;
+        m.parallaxLocalShadow = localShadow;
+      }
+    },
+    setDecalsVisible(v) {
+      for (const d of decals) d.visible = v;
+    },
     cloudDrift: false,
     setClouds(coverage, density, scale) {
       sky.cloudCoverage = coverage;
