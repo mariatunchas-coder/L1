@@ -423,3 +423,97 @@ void main() {
 #endif
 }
 `;
+
+/**
+ * G-buffer pre-pass (depth + velocity + world normal + F0/roughness). Used instead of the plain
+ * depth pre-pass whenever TAA, SSR or motion blur are active.
+ */
+export const gbufVert = /* glsl */ `
+#include <ubo_camera>
+layout(location = 0) in vec3 aPosition;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec2 aUv;
+#ifdef INSTANCED
+layout(location = 4) in vec4 aIM0;
+layout(location = 5) in vec4 aIM1;
+layout(location = 6) in vec4 aIM2;
+layout(location = 7) in vec4 aIM3;
+#endif
+uniform mat4 uModel;
+uniform mat4 uPrevModel;
+uniform mat3 uNormalMatrix;
+out vec3 vNormal;
+out vec2 vUv;
+out vec4 vCurr;
+out vec4 vPrev;
+void main() {
+  mat4 model = uModel;
+  mat4 prevModel = uPrevModel;
+  mat3 nm = uNormalMatrix;
+#ifdef INSTANCED
+  mat4 im = mat4(aIM0, aIM1, aIM2, aIM3);
+  model = uModel * im;
+  prevModel = uPrevModel * im;
+  vec3 c0 = model[0].xyz, c1 = model[1].xyz, c2 = model[2].xyz;
+  nm = mat3(cross(c1, c2), cross(c2, c0), cross(c0, c1)) * sign(dot(c0, cross(c1, c2)));
+#endif
+  vec4 wp = model * vec4(aPosition, 1.0);
+  vNormal = nm * aNormal;
+  vUv = aUv;
+  vCurr = uViewProjUnjit * wp;
+  vPrev = uPrevViewProj * (prevModel * vec4(aPosition, 1.0));
+  gl_Position = uViewProj * wp;
+}
+`;
+
+export const gbufFrag = /* glsl */ `
+layout(location = 0) out vec4 outVelNormal;
+layout(location = 1) out vec4 outMaterial;
+in vec3 vNormal;
+in vec2 vUv;
+in vec4 vCurr;
+in vec4 vPrev;
+uniform vec4 uBaseColor;
+uniform vec2 uRoughMetal;
+uniform vec4 uUvTransform;
+uniform float uAlphaCutoff;
+uniform sampler2D uMap;
+uniform sampler2D uOrmMap;
+
+vec2 octEncode(vec3 n) {
+  n /= (abs(n.x) + abs(n.y) + abs(n.z));
+  vec2 e = n.xy;
+  if (n.z < 0.0) e = (1.0 - abs(e.yx)) * vec2(e.x >= 0.0 ? 1.0 : -1.0, e.y >= 0.0 ? 1.0 : -1.0);
+  return e;
+}
+
+void main() {
+  vec2 uv = vUv * uUvTransform.xy + uUvTransform.zw;
+  vec4 base = uBaseColor;
+#ifdef USE_MAP
+  base *= texture(uMap, uv);
+#endif
+#ifdef ALPHA_TEST
+  if (base.a < uAlphaCutoff) discard;
+#endif
+  float roughness = uRoughMetal.x;
+  float metalness = uRoughMetal.y;
+#ifdef USE_ORM
+  vec3 orm = texture(uOrmMap, uv).rgb;
+  roughness *= orm.g;
+  metalness *= orm.b;
+#endif
+  roughness = clamp(roughness, 0.045, 1.0);
+  vec3 N = normalize(vNormal);
+#ifdef DOUBLE_SIDED
+  if (!gl_FrontFacing) N = -N;
+#endif
+  vec2 vel = (vCurr.xy / vCurr.w - vPrev.xy / vPrev.w) * 0.5;
+  outVelNormal = vec4(vel, octEncode(N));
+#ifdef UNLIT
+  outMaterial = vec4(0.0, 0.0, 0.0, 1.0);
+#else
+  outMaterial = vec4(mix(vec3(0.04), base.rgb, clamp(metalness, 0.0, 1.0)), roughness);
+#endif
+}
+`;

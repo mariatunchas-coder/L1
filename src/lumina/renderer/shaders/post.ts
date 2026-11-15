@@ -214,6 +214,7 @@ uniform vec4 uParams0;     // x exposure, y bloom intensity, z vignette, w grain
 uniform vec4 uParams1;     // x saturation, y contrast, z chromatic aberration, w tone mapper
 uniform vec4 uParams2;     // x auto exposure, y key, z min lum, w max lum
 uniform vec2 uParams3;     // x time, y aspect
+uniform vec2 uParams4;     // x sharpen, y temperature (-1 cool … +1 warm)
 uniform float uFogEnabled;
 in vec2 vUv;
 out vec4 fragColor;
@@ -246,6 +247,14 @@ vec3 reinhard(vec3 c) {
   float tl = l * (1.0 + l / 16.0) / (1.0 + l);
   return clamp(c * (tl / max(l, 1e-5)), 0.0, 1.0);
 }
+// Hable / Uncharted 2 filmic curve
+vec3 hableCurve(vec3 x) {
+  const float A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
+  return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+vec3 filmic(vec3 c) {
+  return clamp(hableCurve(c * 2.0) / hableCurve(vec3(11.2)), 0.0, 1.0);
+}
 vec3 toSRGB(vec3 c) {
   c = clamp(c, 0.0, 1.0);
   return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
@@ -271,7 +280,17 @@ void main() {
     col = col * fog.a + fog.rgb;
   }
 
+  // unsharp mask (compensates TAA softness); deltas are limited so HDR highlights can't ring
+  if (uParams4.x > 0.0) {
+    vec2 tx = 1.0 / vec2(textureSize(uTex0, 0));
+    vec3 nb = min(texture(uTex0, uv + vec2(tx.x, 0.0)).rgb, vec3(32.0)) + min(texture(uTex0, uv - vec2(tx.x, 0.0)).rgb, vec3(32.0))
+            + min(texture(uTex0, uv + vec2(0.0, tx.y)).rgb, vec3(32.0)) + min(texture(uTex0, uv - vec2(0.0, tx.y)).rgb, vec3(32.0));
+    vec3 dlt = clamp(col - nb * 0.25, -col, col);
+    col = max(col + dlt * uParams4.x, 0.0);
+  }
+
   col += texture(uTex1, uv).rgb * uParams0.y;
+  col *= vec3(1.0 + 0.22 * uParams4.y, 1.0 + 0.02 * uParams4.y, 1.0 - 0.22 * uParams4.y);
 
   float exposure = uParams0.x;
   if (uParams2.x > 0.5) {
@@ -287,6 +306,7 @@ void main() {
   if (tm == 1) col = reinhard(col);
   else if (tm == 2) col = acesFilm(col);
   else if (tm == 3) col = neutral(col);
+  else if (tm == 4) col = filmic(col);
   else col = clamp(col, 0.0, 1.0);
 
   float l = luma(col);

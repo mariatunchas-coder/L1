@@ -1,13 +1,17 @@
 import {
+  AnimationMixer,
   BoxGeometry,
   Clock,
   Color,
   CylinderGeometry,
   DirectionalLight,
   Fog,
+  GLTFLoader,
   InstancedMesh,
+  LOD,
   Matrix4,
   Mesh,
+  Object3D,
   OrbitControls,
   PBRMaterial,
   PerspectiveCamera,
@@ -33,7 +37,33 @@ import {
   createRandom,
   createWoodPlanks,
   Euler,
+  type GLTFResult,
+  type Material,
+  type PBRMaterial as PBRMaterialT,
 } from '../lumina';
+import { buildSampleGLB } from './sampleModel';
+
+export type ModelSource = { kind: 'sample' } | { kind: 'url'; url: string; name?: string } | { kind: 'files'; files: File[] };
+
+export interface ModelInfo {
+  name: string;
+  meshes: number;
+  triangles: number;
+  materials: number;
+  textures: number;
+  lights: number;
+  cameras: number;
+  animations: { name: string; duration: number }[];
+  warnings: string[];
+  size: [number, number, number];
+}
+
+export interface PickResult {
+  name: string;
+  distance: number;
+  /** Editable PBR material of the picked mesh (null for instanced / unlit meshes). */
+  material: PBRMaterialT | null;
+}
 
 export interface Showcase {
   renderer: Renderer;
@@ -45,7 +75,18 @@ export interface Showcase {
   fog: Fog;
   stressMesh: InstancedMesh;
   maxInstances: number;
+  model: ModelInfo | null;
   setSun(elevation: number, azimuth: number): void;
+  loadModel(src: ModelSource, onProgress?: (frac: number) => void): Promise<ModelInfo>;
+  clearModel(): void;
+  setModelScale(fit: number): void;
+  setModelLights(on: boolean): void;
+  setPropsVisible(v: boolean): void;
+  playClip(index: number): void;
+  setClipSpeed(s: number): void;
+  screenshot(): Promise<Blob>;
+  setCameraPreset(p: 'default' | 'top' | 'front' | 'low' | 'close'): void;
+  pickObject(ndcX: number, ndcY: number, focus?: boolean): PickResult | null;
   setInstanceCount(n: number): void;
   resize(w: number, h: number): void;
   pick(ndcX: number, ndcY: number): string | null;
@@ -149,11 +190,14 @@ export async function createShowcase(
   }
 
   // ── hero: car paint sphere (clear-coat) ──
-  const carPaint = new Mesh(
-    new SphereGeometry(1.5, 128, 64),
-    new PBRMaterial({ color: lin(0.5, 0.012, 0.02), metalness: 0.55, roughness: 0.38, clearcoat: 1, clearcoatRoughness: 0.025, name: 'Cat mobil' })
-  );
-  carPaint.name = 'Cat mobil (clear-coat)';
+  const carMat = new PBRMaterial({ color: lin(0.5, 0.012, 0.02), metalness: 0.55, roughness: 0.38, clearcoat: 1, clearcoatRoughness: 0.025, name: 'Cat mobil' });
+  // LOD: detailed sphere up close, a cheap one far away (switches with hysteresis)
+  const carPaint = new LOD();
+  const carHi = new Mesh(new SphereGeometry(1.5, 128, 64), carMat);
+  const carLo = new Mesh(new SphereGeometry(1.5, 32, 16), carMat);
+  carHi.name = carLo.name = 'Cat mobil (clear-coat)';
+  carPaint.addLevel(carHi, 0);
+  carPaint.addLevel(carLo, 70);
   carPaint.position.set(0, FLOOR_Y + 1.5, -3.6);
   scene.add(carPaint);
 
@@ -287,6 +331,9 @@ export async function createShowcase(
   stress.update();
   scene.add(stress);
 
+  // everything except ground / platform / sun can be hidden to give imported models a clean stage
+  const props = scene.children.filter((o) => o !== ground && o !== platform && o !== sun);
+
   onProgress(0.9, 'Menginisialisasi renderer…');
   await tick();
 
@@ -297,13 +344,132 @@ export async function createShowcase(
   controls.minDistance = 2;
   controls.maxDistance = 220;
   controls.autoRotateSpeed = 0.12;
+  controls.minTargetY = 0;
 
   const raycaster = new Raycaster();
   const clock = new Clock();
   let raf = 0;
   let running = false;
 
+  // ── glTF model slot ──
+  const loader = new GLTFLoader({ importLights: true });
+  let gltf: GLTFResult | null = null;
+  const modelRoot = new Object3D();
+  modelRoot.name = 'Model glTF';
+  scene.add(modelRoot);
+  let mixer: AnimationMixer | null = null;
+  let fitSize = 5;
+  let activeClip = -1;
+  let clipSpeed = 1;
+
+  const placeModel = () => {
+    if (!gltf) return;
+    const b = gltf.bounds;
+    const ext = Math.max(b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z, 1e-6);
+    const sc = fitSize / ext;
+    modelRoot.scale.setScalar(sc);
+    modelRoot.position.set(-b.center.x * sc, FLOOR_Y - b.min.y * sc, -b.center.z * sc);
+  };
+
   const api: Showcase = {
+    model: null,
+    async loadModel(src, onProg) {
+      let result: GLTFResult;
+      let name = 'Model';
+      if (src.kind === 'sample') {
+        result = await loader.parse(await buildSampleGLB(), '');
+        name = 'Contoh bawaan (GLB buatan kode)';
+      } else if (src.kind === 'url') {
+        result = await loader.load(src.url, (l, t) => onProg?.(t ? l / t : 0));
+        name = src.name ?? src.url.split('/').pop() ?? 'Model';
+      } else {
+        result = await loader.loadFiles(src.files);
+        name = src.files.find((f) => /\.(gltf|glb)$/i.test(f.name))?.name ?? 'Model';
+      }
+      api.clearModel();
+      gltf = result;
+      modelRoot.add(result.scene);
+      placeModel();
+      mixer = result.animations.length ? new AnimationMixer() : null;
+      activeClip = -1;
+      let tris = 0;
+      for (const m of result.meshes) tris += m.geometry.triangleCount;
+      const b = result.bounds;
+      api.model = {
+        name,
+        meshes: result.meshes.length,
+        triangles: tris,
+        materials: result.materials.length,
+        textures: result.textures.length,
+        lights: result.lights.length,
+        cameras: result.cameras.length,
+        animations: result.animations.map((a) => ({ name: a.name, duration: a.duration })),
+        warnings: result.warnings,
+        size: [b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z],
+      };
+      renderer.resetTemporal();
+      if (result.animations.length) api.playClip(0);
+      controls.focusOn(new Vector3(0, FLOOR_Y + fitSize * 0.4, 0), fitSize * 2.6);
+      return api.model;
+    },
+    clearModel() {
+      if (!gltf) return;
+      modelRoot.remove(gltf.scene);
+      gltf.dispose();
+      gltf = null;
+      mixer = null;
+      api.model = null;
+    },
+    setModelScale(fit) {
+      fitSize = fit;
+      placeModel();
+    },
+    setModelLights(on) {
+      gltf?.lights.forEach((l) => (l.visible = on));
+    },
+    setPropsVisible(v) {
+      props.forEach((o) => (o.visible = v));
+    },
+    playClip(i) {
+      if (!mixer || !gltf) return;
+      mixer.stopAll();
+      activeClip = i;
+      if (i >= 0 && gltf.animations[i]) {
+        const a = mixer.clipAction(gltf.animations[i]);
+        a.timeScale = clipSpeed;
+        a.play();
+      }
+    },
+    setClipSpeed(s) {
+      clipSpeed = s;
+      if (mixer && activeClip >= 0) mixer.actions.forEach((a) => (a.timeScale = s));
+    },
+    screenshot() {
+      return renderer.screenshot(scene, camera);
+    },
+    setCameraPreset(p) {
+      const t = gltf ? new Vector3(0, FLOOR_Y + fitSize * 0.4, 0) : new Vector3(0, 2.0, -0.5);
+      const d = gltf ? fitSize * 2.6 : 26;
+      if (p === 'default') controls.setView(new Vector3(0, 2.0, -0.5), 26, 32, 13);
+      else if (p === 'top') controls.setView(t, d * 1.2, 20, 72);
+      else if (p === 'front') controls.setView(t, d, 0, 8);
+      else if (p === 'low') controls.setView(t, d * 0.8, 40, 2);
+      else controls.setView(t, d * 0.45, 50, 14);
+      renderer.resetTemporal();
+    },
+    pickObject(nx, ny, focus = true) {
+      raycaster.setFromCamera(nx, ny, camera);
+      const hits = raycaster.intersectObjects([scene]).filter((h) => h.object !== ground);
+      if (!hits.length) return null;
+      const h = hits[0];
+      if (focus) controls.focusOn(h.point);
+      const mat: Material = h.object.material;
+      return {
+        name: h.object.name || h.object.type,
+        distance: h.distance,
+        material: mat.kind === 'pbr' && h.instanceId === undefined ? (mat as PBRMaterialT) : null,
+      };
+    },
     renderer,
     scene,
     camera,
@@ -328,12 +494,7 @@ export async function createShowcase(
       camera.updateProjectionMatrix();
     },
     pick(nx, ny) {
-      raycaster.setFromCamera(nx, ny, camera);
-      const hits = raycaster.intersectObjects([scene]).filter((h) => h.object !== ground);
-      if (!hits.length) return null;
-      const h = hits[0];
-      controls.focusOn(h.point);
-      return h.object.name || h.object.type;
+      return api.pickObject(nx, ny, true)?.name ?? null;
     },
     start() {
       if (running) return;
@@ -347,6 +508,7 @@ export async function createShowcase(
           knot.rotation.y = t * 0.35;
           knot.rotation.x = t * 0.2;
           carPaint.rotation.y = t * 0.1;
+          mixer?.update(dt);
           neonLight.intensity = 90 * (0.93 + 0.07 * Math.sin(t * 7.0) * Math.sin(t * 2.3));
           blueLight.position.set(10.5 * Math.cos(t * 0.25), FLOOR_Y + 2.4, 2.5 + 7 * Math.sin(t * 0.25));
           bulb.position.copy(blueLight.position);
@@ -362,6 +524,7 @@ export async function createShowcase(
     },
     dispose() {
       api.stop();
+      api.clearModel();
       controls.dispose();
       renderer.dispose();
     },

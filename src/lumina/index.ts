@@ -1,6 +1,9 @@
 /**
  * Lumina – a performance-first, physically based WebGL2 rendering engine.
  *
+ * Features: PBR + IBL, cascaded shadows, SSAO, SSR, TAA, DoF, motion blur, volumetric fog, bloom,
+ * auto exposure, glTF 2.0 loader, animation, LOD, GPU instancing, GPU timing.
+ *
  *   import { Renderer, Scene, PerspectiveCamera, Mesh, SphereGeometry, PBRMaterial } from './lumina';
  */
 export * from './math/MathUtils';
@@ -24,11 +27,18 @@ export { Sky, Fog } from './core/Sky';
 export { Raycaster } from './core/Raycaster';
 export type { Intersection } from './core/Raycaster';
 export { Clock } from './core/Clock';
+export { LOD } from './core/LOD';
+
+export { AnimationClip, AnimationAction, AnimationMixer, KeyframeTrack } from './animation/Animation';
+export type { Interpolation, TrackProperty, LoopMode } from './animation/Animation';
+export { GLTFLoader } from './loaders/GLTFLoader';
+export type { GLTFResult, GLTFLoaderOptions } from './loaders/GLTFLoader';
 
 export { BoxGeometry, RoundedBoxGeometry, SphereGeometry, PlaneGeometry, CylinderGeometry, TorusGeometry, TorusKnotGeometry } from './geometry/Primitives';
 export * from './textures/Procedural';
 
 export { Renderer } from './renderer/Renderer';
 export type { RendererOptions, RenderInfo } from './renderer/Renderer';
+export { defaultPostSettings } from './renderer/PostProcessor';
 export type { PostSettings, ToneMapping } from './renderer/PostProcessor';
 export { OrbitControls } from './controls/OrbitControls';

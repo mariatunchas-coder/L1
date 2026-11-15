@@ -65,3 +65,63 @@ export function Stat({ k, v, warn }: { k: string; v: string; warn?: boolean }) {
     </div>
   );
 }
+
+export function Button({ children, onClick, variant = 'default', disabled, title }: { children: ReactNode; onClick?: () => void; variant?: 'default' | 'primary' | 'danger'; disabled?: boolean; title?: string }) {
+  const cls = variant === 'primary' ? 'bg-sky-500 text-white hover:bg-sky-400' : variant === 'danger' ? 'bg-rose-500/20 text-rose-200 hover:bg-rose-500/40' : 'bg-white/8 text-slate-200 hover:bg-white/15';
+  return (
+    <button title={title} disabled={disabled} onClick={onClick} className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${cls}`}>
+      {children}
+    </button>
+  );
+}
+
+export function ColorField({ label, value, onChange }: { label: string; value: string; onChange: (hex: string) => void }) {
+  return (
+    <label className="flex items-center justify-between text-xs text-slate-400">
+      <span>{label}</span>
+      <span className="flex items-center gap-2">
+        <span className="font-mono text-[11px] text-sky-300">{value}</span>
+        <input type="color" value={value} onChange={(e) => onChange(e.target.value)} className="h-5 w-8 cursor-pointer rounded border-0 bg-transparent p-0" />
+      </span>
+    </label>
+  );
+}
+
+export function Select<T extends string | number>({ label, value, options, onChange }: { label: string; value: T; options: { label: string; value: T }[]; onChange: (v: T) => void }) {
+  return (
+    <label className="block">
+      <div className="mb-1 text-xs text-slate-400">{label}</div>
+      <select
+        value={String(value)}
+        onChange={(e) => {
+          const o = options.find((x) => String(x.value) === e.target.value);
+          if (o) onChange(o.value);
+        }}
+        className="w-full rounded-md bg-slate-800 px-2 py-1.5 text-xs text-slate-100 ring-1 ring-white/10 outline-none focus:ring-sky-400"
+      >
+        {options.map((o) => (
+          <option key={String(o.value)} value={String(o.value)}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+export function Tabs<T extends string>({ value, tabs, onChange }: { value: T; tabs: { id: T; label: string }[]; onChange: (v: T) => void }) {
+  return (
+    <div className="sticky top-0 z-10 flex gap-0.5 bg-slate-950/95 p-1.5 backdrop-blur">
+      {tabs.map((t) => (
+        <button key={t.id} onClick={() => onChange(t.id)} className={`flex-1 rounded-md px-1 py-1.5 text-[11px] font-semibold tracking-wide transition-colors ${t.id === value ? 'bg-sky-500 text-white' : 'text-slate-400 hover:bg-white/5 hover:text-white'}`}>
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export function Note({ children, tone = 'info' }: { children: ReactNode; tone?: 'info' | 'warn' | 'error' }) {
+  const cls = tone === 'error' ? 'bg-rose-500/10 text-rose-200 ring-rose-400/30' : tone === 'warn' ? 'bg-amber-500/10 text-amber-200 ring-amber-400/30' : 'bg-sky-500/10 text-sky-100 ring-sky-400/20';
+  return <div className={`rounded-lg p-2.5 text-[11px] leading-relaxed ring-1 ${cls}`}>{children}</div>;
+}

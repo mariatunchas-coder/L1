@@ -18,6 +18,9 @@ export class Mesh extends Object3D {
   private _wsBounds = -1;
   /** bumped whenever local bounds change (InstancedMesh.update) */
   boundsVersion = 0;
+  /** world matrix of the previous rendered frame (motion vectors for TAA / motion blur) */
+  readonly prevMatrixWorld = new Matrix4();
+  prevWorldVersion = -1;
 
   /** World-space bounding sphere, recomputed only when the transform or bounds changed. */
   getWorldSphere(): Float64Array {

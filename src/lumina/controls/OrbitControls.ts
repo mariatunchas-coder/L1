@@ -21,6 +21,8 @@ export class OrbitControls {
   panSpeed = 1;
   autoRotate = false;
   autoRotateSpeed = 0.15;
+  /** The orbit target can't be panned below this world height (default: unrestricted). */
+  minTargetY = -Infinity;
 
   private radius = 10;
   private theta = 0;
@@ -74,6 +76,17 @@ export class OrbitControls {
   focusOn(p: Vector3, distance?: number): void {
     this.gTarget.copy(p);
     if (distance) this.gRadius = clamp(distance, this.minDistance, this.maxDistance);
+  }
+
+  /** Frames a bounding sphere: moves the target to its centre and picks a distance that fits it in view. */
+  frameBounds(center: Vector3, radius: number, azimuthDeg = this.theta / DEG2RAD, elevationDeg = 90 - this.phi / DEG2RAD): void {
+    const dist = (radius / Math.sin((Math.min(this.camera.fov, this.camera.fov * this.camera.aspect) * DEG2RAD) / 2)) * 1.1;
+    this.minDistance = Math.min(this.minDistance, dist * 0.05);
+    this.maxDistance = Math.max(this.maxDistance, dist * 4);
+    this.setView(center, dist, azimuthDeg, elevationDeg);
+    this.camera.near = Math.max(0.01, dist / 1000);
+    this.camera.far = Math.max(this.camera.far, dist * 20);
+    this.camera.updateProjectionMatrix();
   }
 
   private pointerDown = (e: PointerEvent) => {
@@ -145,7 +158,7 @@ export class OrbitControls {
     this.gTarget.x += (-dx * rx + dy * ux) * k;
     this.gTarget.y += (-dx * ry + dy * uy) * k;
     this.gTarget.z += (-dx * rz + dy * uz) * k;
-    if (this.gTarget.y < 0) this.gTarget.y = 0;
+    if (this.gTarget.y < this.minTargetY) this.gTarget.y = this.minTargetY;
   }
 
   update(dt: number): void {

@@ -30,8 +30,40 @@ layout(std140) uniform Camera {
   mat4 uInvViewProj;
   vec4 uCamPos;      // xyz = world position, w = time (s)
   vec4 uScreen;      // xy = render target size (px), zw = 1/size
-  vec4 uCamParams;   // x = near, y = far
+  vec4 uCamParams;   // x = near, y = far, zw = TAA jitter (NDC, already baked into uProj / uViewProj)
+  mat4 uPrevViewProj;     // previous frame, un-jittered
+  mat4 uViewProjUnjit;    // this frame, un-jittered
 };
+`,
+
+  // Helpers shared by the screen-space effects. Requires <ubo_camera>.
+  depth_util: /* glsl */ `
+float linZ(float d) {
+  float z = d * 2.0 - 1.0;
+  return 2.0 * uCamParams.x * uCamParams.y / (uCamParams.y + uCamParams.x - z * (uCamParams.y - uCamParams.x));
+}
+vec3 worldPosFromDepth(vec2 uv, float d) {
+  vec4 w = uInvViewProj * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+  return w.xyz / w.w;
+}
+vec3 viewPosFromDepth(vec2 uv, float d) {
+  return (uView * vec4(worldPosFromDepth(uv, d), 1.0)).xyz;
+}
+// octahedral normal decoding (matches the G-buffer writer)
+vec3 octDecode(vec2 e) {
+  vec3 n = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+  if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+  return normalize(n);
+}
+// Screen-space motion (uv units) of an infinitely distant pixel – only camera rotation matters.
+vec2 skyVelocity(vec2 uv) {
+  vec4 w = uInvViewProj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+  vec3 dir = normalize(w.xyz / w.w - uCamPos.xyz);
+  vec3 p = uCamPos.xyz + dir * 1000.0;
+  vec4 c = uViewProjUnjit * vec4(p, 1.0);
+  vec4 q = uPrevViewProj * vec4(p, 1.0);
+  return (c.xy / c.w - q.xy / q.w) * 0.5;
+}
 `,
 
   ubo_lights: /* glsl */ `

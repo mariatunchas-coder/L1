@@ -8,10 +8,11 @@ export const volumetricFrag = /* glsl */ `
 #include <common>
 #include <ubo_camera>
 #include <ubo_lights>
-#include <fog_shadow>
 
 uniform sampler2D uTex0;         // full-res scene depth (bound to unit 0, see SAMPLER_UNITS)
+// must be declared BEFORE <fog_shadow>, which samples it
 uniform sampler2DArrayShadow uShadowMap; // unit 3, see SAMPLER_UNITS
+#include <fog_shadow>
 uniform vec2 uInvOutSize;        // 1 / (half-res) size
 uniform float uDensity;          // extinction at base height (1/m)
 uniform float uHeightFalloff;    // 1/m

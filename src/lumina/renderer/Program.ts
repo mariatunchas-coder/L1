@@ -18,7 +18,11 @@ export const SAMPLER_UNITS: Record<string, number> = {
   uTex1: 1,
   uTex2: 2,
   uTex3: 3,
+  uTex4: 4,
+  uTex5: 5,
   uCube: 0,
+  /** pre-filtered environment for screen-space reflections (post passes only) */
+  uEnvCube: 10,
 };
 
 export const UBO_CAMERA = 0;

@@ -2,6 +2,7 @@ import type { PerspectiveCamera } from '../core/Camera';
 import type { DirectionalLight, Light, PointLight, SpotLight } from '../core/Lights';
 import { DoubleSide, Material, PBRMaterial, UnlitMaterial } from '../core/Material';
 import { InstancedMesh, Mesh } from '../core/Mesh';
+import type { LOD } from '../core/LOD';
 import type { Object3D } from '../core/Object3D';
 import type { Scene } from '../core/Scene';
 import { Sky } from '../core/Sky';
@@ -14,9 +15,10 @@ import { EnvironmentMaps, createBackgroundProgram } from './Environment';
 import { GLState, TEX_2D, TEX_2D_ARRAY, TEX_CUBE } from './GLState';
 import { PostProcessor, PostSettings, defaultPostSettings } from './PostProcessor';
 import { Program, UBO_CAMERA, UBO_LIGHTS } from './Program';
-import { ColorTarget, DepthTarget, createColorTarget, createDepthTarget, deleteColorTarget } from './RenderTarget';
+import { GpuTimer } from './GpuTimer';
+import { ColorTarget, GBufferTarget, createColorTarget, createGBuffer, deleteColorTarget, deleteGBuffer } from './RenderTarget';
 import { Resources } from './Resources';
-import { depthFrag, depthVert, pbrFrag, pbrVert } from './shaders/pbr';
+import { depthFrag, depthVert, gbufFrag, gbufVert, pbrFrag, pbrVert } from './shaders/pbr';
 
 export interface RendererOptions {
   canvas?: HTMLCanvasElement;
@@ -47,6 +49,10 @@ export interface RenderInfo {
   width: number;
   height: number;
   renderScale: number;
+  /** GPU time of the last completed frames (ms, smoothed). 0 when EXT_disjoint_timer_query is unavailable. */
+  gpuMs: number;
+  /** Number of times the WebGL context was lost and successfully restored. */
+  contextRestores: number;
 }
 
 interface RenderItem {
@@ -75,11 +81,30 @@ const F_MAP = 1,
   F_SSAO = 8192,
   F_FOG = 16384;
 
-const CAM_FLOATS = 76;
+const CAM_FLOATS = 108;
 const LIGHT_FLOATS = 104 + 32 * 16;
 const MAX_LIGHTS = 32;
 
 const _vp = new Matrix4();
+const _vpU = new Matrix4();
+const _proj = new Matrix4();
+const _invVP = new Matrix4();
+const ZERO4 = new Float32Array(4);
+
+/** Halton(2,3) low-discrepancy sequence – sub-pixel jitter offsets in [0,1) for TAA. */
+const HALTON: [number, number][] = (() => {
+  const h = (i: number, b: number) => {
+    let f = 1,
+      r = 0;
+    while (i > 0) {
+      f /= b;
+      r += f * (i % b);
+      i = Math.floor(i / b);
+    }
+    return r;
+  };
+  return Array.from({ length: 16 }, (_, i) => [h(i + 1, 2), h(i + 1, 3)] as [number, number]);
+})();
 const _tmp = new Vector3();
 const _sunDir = new Vector3();
 const _frustum = new Frustum();
@@ -87,8 +112,11 @@ const _frustum = new Frustum();
 export class Renderer {
   readonly canvas: HTMLCanvasElement;
   readonly gl: WebGL2RenderingContext;
-  readonly state: GLState;
-  readonly resources: Resources;
+  state!: GLState;
+  resources!: Resources;
+  /** Called when the browser drops the GPU context / when it has been fully rebuilt. */
+  onContextLost: (() => void) | null = null;
+  onContextRestored: (() => void) | null = null;
 
   /** Tone mapping, bloom, SSAO, exposure, grading … */
   post: PostSettings = defaultPostSettings();
@@ -121,6 +149,8 @@ export class Renderer {
     width: 0,
     height: 0,
     renderScale: 1,
+    gpuMs: 0,
+    contextRestores: 0,
   };
   readonly capabilities: { maxSamples: number; gpu: string };
 
@@ -133,8 +163,8 @@ export class Renderer {
   private rw = 0;
   private rh = 0;
 
-  private camBuf: WebGLBuffer;
-  private lightBuf: WebGLBuffer;
+  private camBuf!: WebGLBuffer;
+  private lightBuf!: WebGLBuffer;
   private camData = new Float32Array(CAM_FLOATS);
   private lightData = new Float32Array(LIGHT_FLOATS);
 
@@ -142,18 +172,25 @@ export class Renderer {
   private msaaFbo: WebGLFramebuffer | null = null;
   private msaaColor: WebGLRenderbuffer | null = null;
   private msaaDepth: WebGLRenderbuffer | null = null;
-  private depthPre: DepthTarget | null = null;
+  private depthPre: GBufferTarget | null = null;
 
-  private env: EnvironmentMaps;
+  private env!: EnvironmentMaps;
   private defaultSky = new Sky();
   private lastEnvUpdate = -1e9;
-  private bgProgram: Program;
-  private post_: PostProcessor;
-  private csm: CascadedShadows;
-  private parallelExt: { COMPLETION_STATUS_KHR: number } | null;
+  private bgProgram!: Program;
+  private post_!: PostProcessor;
+  private csm!: CascadedShadows;
+  private timer!: GpuTimer;
+  private parallelExt: { COMPLETION_STATUS_KHR: number } | null = null;
 
   private programs = new Map<number, Program>();
   private depthPrograms = new Map<number, Program>();
+  private gbufPrograms = new Map<number, Program>();
+  private frameMeshes: Mesh[] = [];
+  private prevVP = new Matrix4();
+  private havePrev = false;
+  private temporalReset = false;
+  private listeners: [string, EventListener][] = [];
   private opaque: RenderItem[] = [];
   private transparent: RenderItem[] = [];
   private pool: RenderItem[] = [];
@@ -182,10 +219,8 @@ export class Renderer {
     });
     if (!gl) throw new Error('Lumina: WebGL2 is not supported by this browser.');
     this.gl = gl;
-    if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('Lumina: EXT_color_buffer_float (HDR rendering) is required.');
-    gl.getExtension('EXT_color_buffer_half_float');
-    gl.getExtension('OES_texture_float_linear');
-    this.parallelExt = gl.getExtension('KHR_parallel_shader_compile');
+    this.envResolution = opts.environmentResolution ?? 256;
+    this.initGL();
 
     const dbg = gl.getExtension('WEBGL_debug_renderer_info');
     this.capabilities = {
@@ -195,11 +230,38 @@ export class Renderer {
     this.samples = Math.min(opts.samples ?? 4, this.capabilities.maxSamples);
     this.pixelRatio = opts.pixelRatio ?? Math.min(window.devicePixelRatio || 1, 2);
 
-    this.canvas.addEventListener('webglcontextlost', (e) => {
-      e.preventDefault();
+    const on = (type: string, fn: EventListener) => {
+      this.canvas.addEventListener(type, fn);
+      this.listeners.push([type, fn]);
+    };
+    on('webglcontextlost', (e) => {
+      e.preventDefault(); // required, otherwise the browser never restores the context
       this.contextLost = true;
-      console.warn('Lumina: WebGL context lost');
+      console.warn('Lumina: WebGL context lost – waiting for restore');
+      this.onContextLost?.();
     });
+    on('webglcontextrestored', () => {
+      try {
+        this.initGL();
+        this.contextLost = false;
+        this.info.contextRestores++;
+        console.info('Lumina: WebGL context restored');
+        this.onContextRestored?.();
+      } catch (err) {
+        console.error('Lumina: failed to restore the WebGL context', err);
+      }
+    });
+  }
+
+  private envResolution: number;
+
+  /** (Re)creates every GPU object. Runs once at start-up and again after a context restore. */
+  private initGL(): void {
+    const gl = this.gl;
+    if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('Lumina: EXT_color_buffer_float (HDR rendering) is required.');
+    gl.getExtension('EXT_color_buffer_half_float');
+    gl.getExtension('OES_texture_float_linear');
+    this.parallelExt = gl.getExtension('KHR_parallel_shader_compile');
 
     this.state = new GLState(gl);
     this.resources = new Resources(gl, this.state);
@@ -213,10 +275,23 @@ export class Renderer {
     gl.bufferData(gl.UNIFORM_BUFFER, this.lightData.byteLength, gl.DYNAMIC_DRAW);
     gl.bindBufferBase(gl.UNIFORM_BUFFER, UBO_LIGHTS, this.lightBuf);
 
-    this.env = new EnvironmentMaps(gl, this.state, opts.environmentResolution ?? 256);
+    this.env = new EnvironmentMaps(gl, this.state, this.envResolution);
     this.bgProgram = createBackgroundProgram(gl, this.state);
     this.post_ = new PostProcessor(gl, this.state);
     this.csm = new CascadedShadows(gl, this.state);
+    this.timer = new GpuTimer(gl);
+
+    // forget every handle of the previous context (they are invalid after a restore)
+    this.programs.clear();
+    this.depthPrograms.clear();
+    this.gbufPrograms.clear();
+    this.hdr = this.depthPre = null;
+    this.msaaFbo = this.msaaColor = this.msaaDepth = null;
+    this.rw = this.rh = 0;
+    this.lastEnvUpdate = -1e9;
+    this.frameCount = 0;
+    this.havePrev = false;
+    this.textureMaterial = null;
   }
 
   // ═════════════════════════════════ public API ═════════════════════════════════
@@ -251,9 +326,35 @@ export class Renderer {
     return { width: this.canvasW, height: this.canvasH };
   }
 
+  /** Discards temporal history (call after teleporting / cutting the camera to avoid ghosting). */
+  resetTemporal(): void {
+    this.temporalReset = true;
+  }
+
+  /** Renders one frame and returns it as an image (the canvas is read in the same task, so no preserveDrawingBuffer needed). */
+  screenshot(scene: Scene, camera: PerspectiveCamera, type = 'image/png', quality = 0.92): Promise<Blob> {
+    this.render(scene, camera);
+    return new Promise((resolve, reject) => this.canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Lumina: screenshot failed'))), type, quality));
+  }
+
+  get gpuTimerSupported(): boolean {
+    return this.timer.supported;
+  }
+
   /** Renders `scene` as seen from `camera` to the canvas. */
   render(scene: Scene, camera: PerspectiveCamera): void {
     if (this.contextLost) return;
+    this.timer.poll();
+    this.timer.begin();
+    try {
+      this.renderFrame(scene, camera);
+    } finally {
+      this.timer.end();
+    }
+    this.info.gpuMs = this.timer.ms;
+  }
+
+  private renderFrame(scene: Scene, camera: PerspectiveCamera): void {
     const t0 = performance.now();
     const gl = this.gl;
     const st = this.state;
@@ -274,7 +375,11 @@ export class Renderer {
 
     const rw = Math.max(1, Math.floor(this.canvasW * this.renderScale));
     const rh = Math.max(1, Math.floor(this.canvasH * this.renderScale));
-    this.ensureTargets(rw, rh);
+    const P = this.post;
+    const taaOn = P.taa.enabled;
+    const needColor = taaOn || P.ssr.enabled || P.motionBlur.enabled;
+    const needDepth = needColor || P.dof.enabled || P.ssao.enabled || P.volumetricFog.enabled;
+    this.ensureTargets(rw, rh, needDepth, needColor);
 
     // ── image based lighting (re-baked lazily when the sky changes) ──
     const sky = scene.sky ?? this.defaultSky;
@@ -284,13 +389,29 @@ export class Renderer {
     }
 
     // ── per-frame camera data ──
-    _vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-    _frustum.setFromProjectionMatrix(_vp);
+    _vpU.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    // TAA: shift the projection by a sub-pixel Halton offset (the camera object itself is never modified)
+    let jx = 0,
+      jy = 0;
+    if (taaOn) {
+      const hj = HALTON[this.frameCount & 15];
+      jx = ((hj[0] - 0.5) * P.taa.jitter * 2) / rw;
+      jy = ((hj[1] - 0.5) * P.taa.jitter * 2) / rh;
+    }
+    _proj.copy(camera.projectionMatrix);
+    _proj.elements[8] -= jx;
+    _proj.elements[9] -= jy;
+    _vp.multiplyMatrices(_proj, camera.matrixWorldInverse);
+    _frustum.setFromProjectionMatrix(_vpU);
+    if (!this.havePrev) {
+      this.prevVP.copy(_vpU);
+      this.havePrev = true;
+    }
     const cd = this.camData;
     cd.set(camera.matrixWorldInverse.elements, 0);
-    cd.set(camera.projectionMatrix.elements, 16);
+    cd.set(_proj.elements, 16);
     cd.set(_vp.elements, 32);
-    cd.set(new Matrix4().copy(_vp).invert().elements, 48);
+    cd.set(_invVP.copy(_vp).invert().elements, 48);
     camera.getWorldPosition(_tmp);
     cd[64] = _tmp.x;
     cd[65] = _tmp.y;
@@ -302,6 +423,10 @@ export class Renderer {
     cd[71] = 1 / rh;
     cd[72] = camera.near;
     cd[73] = camera.far;
+    cd[74] = jx;
+    cd[75] = jy;
+    cd.set(this.prevVP.elements, 76);
+    cd.set(_vpU.elements, 92);
     gl.bindBuffer(gl.UNIFORM_BUFFER, this.camBuf);
     gl.bufferSubData(gl.UNIFORM_BUFFER, 0, cd);
 
@@ -311,13 +436,14 @@ export class Renderer {
     const sun = this.sun;
     const useShadows = this.shadowsEnabled && !!sun && sun.castShadow && this.casters.length > 0;
     const useSSAO = this.post.ssao.enabled;
+    const useGBuf = needColor && !!this.depthPre && this.depthPre.hasColor;
     // volumetric fog needs its own shadow-mapped sun, and a depth buffer to raymarch against
     const useVolumetricFog = this.post.volumetricFog.enabled && useShadows;
-    const useDepthPre = useSSAO || useVolumetricFog;
+    const useDepthPre = useSSAO || useVolumetricFog || needDepth;
     const fog = scene.fog;
 
     if (useShadows) this.renderShadows(sun!, camera);
-    if (useDepthPre) this.renderDepthPrepass(_vp);
+    if (useDepthPre) this.renderDepthPrepass(_vp, useGBuf);
     const aoTex = useSSAO ? this.post_.renderSSAO(this.depthPre!.texture, camera, this.post.ssao, rw, rh) : null;
 
     this.fillLights(scene, camera, sun, useShadows);
@@ -367,9 +493,35 @@ export class Renderer {
     const fogTex = useVolumetricFog
       ? this.post_.renderVolumetricFog(this.depthPre!.texture, this.csm.texture!, camera, p.volumetricFog, rw, rh)
       : null;
-    const bloomTex = p.bloom.enabled ? this.post_.renderBloom(hdrTex, p.bloom, rw, rh) : null;
+
+    // ── G-buffer driven effects: SSR → TAA → DoF → motion blur (each reads the previous result) ──
+    let cur = hdrTex;
+    const gb = this.depthPre;
+    if (gb && useGBuf) {
+      if (p.ssr.enabled) {
+        const ssrTex = this.post_.renderSSR(cur, gb, camera, p.ssr, rw, rh, this.frameCount);
+        cur = this.post_.applySSR(cur, ssrTex, gb, this.env.prefilter, p.ssr.intensity, rw, rh);
+      }
+      if (taaOn) cur = this.post_.resolveTAA(cur, gb, p.taa, rw, rh, this.temporalReset);
+    }
+    if (!taaOn) this.post_.resetHistory();
+    if (gb && p.dof.enabled) cur = this.post_.dof(cur, gb, p.dof, rw, rh);
+    if (gb && useGBuf && p.motionBlur.enabled) cur = this.post_.motionBlur(cur, gb, p.motionBlur, rw, rh);
+
+    const bloomTex = p.bloom.enabled ? this.post_.renderBloom(cur, p.bloom, rw, rh) : null;
     if (p.autoExposure) this.post_.updateAutoExposure(hdrTex, rw, rh, dt, p);
-    this.post_.composite(hdrTex, bloomTex, fogTex, p, nowS, this.canvasW, this.canvasH);
+    this.post_.composite(cur, bloomTex, fogTex, p, nowS, this.canvasW, this.canvasH);
+
+    // ── remember this frame for the next frame's motion vectors ──
+    this.prevVP.copy(_vpU);
+    for (let i = 0; i < this.frameMeshes.length; i++) {
+      const m = this.frameMeshes[i];
+      if (m.prevWorldVersion !== m.worldVersion) {
+        m.prevMatrixWorld.copy(m.matrixWorld);
+        m.prevWorldVersion = m.worldVersion;
+      }
+    }
+    this.temporalReset = false;
 
     // ── stats ──
     info.lights = this.lights.length;
@@ -384,12 +536,16 @@ export class Renderer {
   }
 
   dispose(): void {
+    for (const [t, fn] of this.listeners) this.canvas.removeEventListener(t, fn);
+    this.listeners = [];
+    this.timer.dispose();
     this.releaseTargets();
     this.env.dispose();
     this.post_.dispose();
     this.csm.dispose();
     for (const p of this.programs.values()) p.dispose();
     for (const p of this.depthPrograms.values()) p.dispose();
+    for (const p of this.gbufPrograms.values()) p.dispose();
     this.bgProgram.dispose();
     this.gl.deleteBuffer(this.camBuf);
     this.gl.deleteBuffer(this.lightBuf);
@@ -422,7 +578,7 @@ export class Renderer {
   private releaseTargets(): void {
     const gl = this.gl;
     deleteColorTarget(gl, this.state, this.hdr);
-    deleteColorTarget(gl, this.state, this.depthPre);
+    deleteGBuffer(gl, this.state, this.depthPre);
     if (this.msaaFbo) gl.deleteFramebuffer(this.msaaFbo);
     if (this.msaaColor) gl.deleteRenderbuffer(this.msaaColor);
     if (this.msaaDepth) gl.deleteRenderbuffer(this.msaaDepth);
@@ -431,7 +587,7 @@ export class Renderer {
     this.rw = this.rh = 0;
   }
 
-  private ensureTargets(w: number, h: number): void {
+  private ensureTargets(w: number, h: number, needDepth: boolean, needColor: boolean): void {
     const gl = this.gl;
     if (w !== this.rw || h !== this.rh || !this.hdr) {
       this.releaseTargets();
@@ -454,7 +610,13 @@ export class Renderer {
       }
       this.post_.resize(w, h);
     }
-    if ((this.post.ssao.enabled || this.post.volumetricFog.enabled) && !this.depthPre) this.depthPre = createDepthTarget(gl, this.state, w, h);
+    if (needDepth) {
+      if (this.depthPre && needColor && !this.depthPre.hasColor) {
+        deleteGBuffer(gl, this.state, this.depthPre);
+        this.depthPre = null;
+      }
+      if (!this.depthPre) this.depthPre = createGBuffer(gl, this.state, w, h, needColor);
+    }
   }
 
   // ───────────────────────── scene traversal & culling ─────────────────────────
@@ -468,6 +630,7 @@ export class Renderer {
     this.opaque.length = 0;
     this.transparent.length = 0;
     this.casters.length = 0;
+    this.frameMeshes.length = 0;
     this.lights.length = 0;
     this.sun = null;
     this.poolIndex = 0;
@@ -476,6 +639,7 @@ export class Renderer {
 
   private visit(o: Object3D, camera: PerspectiveCamera): void {
     if (!o.visible) return;
+    if ((o as LOD).isLOD) (o as LOD).update(camera);
     if (o.isLight) {
       const l = o as Light;
       if (l.type === 'DirectionalLight') {
@@ -485,6 +649,11 @@ export class Renderer {
       const mesh = o as Mesh;
       const mat = mesh.material;
       this.info.objects++;
+      this.frameMeshes.push(mesh);
+      if (mesh.prevWorldVersion < 0) {
+        mesh.prevMatrixWorld.copy(mesh.matrixWorld);
+        mesh.prevWorldVersion = mesh.worldVersion;
+      }
       if (mat.visible && (!(mesh as InstancedMesh).instanceMatrix || (mesh as InstancedMesh).count > 0)) {
         const s = mesh.getWorldSphere();
         if (mesh.castShadow && !mat.transparent) {
@@ -580,6 +749,23 @@ export class Renderer {
       if (key & F_MAP) d.push('USE_MAP');
       p = new Program(this.gl, this.state, depthVert, depthFrag, d, 'depth[' + d.join(',') + ']', this.parallelExt);
       this.depthPrograms.set(key, p);
+    }
+    return p;
+  }
+
+  private getGBufProgram(flags: number): Program {
+    const key = flags & (F_INSTANCED | F_ALPHATEST | F_MAP | F_ORM | F_DOUBLE | F_UNLIT);
+    let p = this.gbufPrograms.get(key);
+    if (!p) {
+      const d: string[] = [];
+      if (key & F_INSTANCED) d.push('INSTANCED');
+      if (key & F_ALPHATEST) d.push('ALPHA_TEST');
+      if (key & F_MAP) d.push('USE_MAP');
+      if (key & F_ORM) d.push('USE_ORM');
+      if (key & F_DOUBLE) d.push('DOUBLE_SIDED');
+      if (key & F_UNLIT) d.push('UNLIT');
+      p = new Program(this.gl, this.state, gbufVert, gbufFrag, d, 'gbuf[' + d.join(',') + ']', this.parallelExt);
+      this.gbufPrograms.set(key, p);
     }
     return p;
   }
@@ -704,6 +890,39 @@ export class Renderer {
     this.drawGeometry(mesh);
   }
 
+  private drawGBufMesh(mesh: Mesh, program: Program, flags: number): void {
+    const gl = this.gl;
+    const st = this.state;
+    const mat = mesh.material;
+    const L = program.loc;
+    gl.uniformMatrix4fv(L.uModel, false, mesh.matrixWorld.elements);
+    gl.uniformMatrix4fv(L.uPrevModel, false, mesh.prevMatrixWorld.elements);
+    if (!(flags & F_INSTANCED)) {
+      if (mesh.normalMatrixVersion !== mesh.worldVersion) {
+        mesh.normalMatrix.setNormalMatrix(mesh.matrixWorld);
+        mesh.normalMatrixVersion = mesh.worldVersion;
+      }
+      gl.uniformMatrix3fv(L.uNormalMatrix, false, mesh.normalMatrix.elements);
+    }
+    if (mat.kind === 'pbr') {
+      const m = mat as PBRMaterial;
+      if (m.map) st.bindTexture(5, TEX_2D, this.resources.getTexture(m.map));
+      if (m.ormMap) st.bindTexture(7, TEX_2D, this.resources.getTexture(m.ormMap));
+      gl.uniform4f(L.uBaseColor, m.color.r, m.color.g, m.color.b, m.opacity);
+      gl.uniform2f(L.uRoughMetal, m.roughness, m.metalness);
+      gl.uniform4f(L.uUvTransform, m.uvTransform[0], m.uvTransform[1], m.uvTransform[2], m.uvTransform[3]);
+    } else {
+      const m = mat as UnlitMaterial;
+      if (m.map) st.bindTexture(5, TEX_2D, this.resources.getTexture(m.map));
+      gl.uniform4f(L.uBaseColor, m.color.r, m.color.g, m.color.b, m.opacity);
+      gl.uniform2f(L.uRoughMetal, 1, 0);
+      gl.uniform4f(L.uUvTransform, 1, 1, 0, 0);
+    }
+    gl.uniform1f(L.uAlphaCutoff, mat.alphaTest);
+    st.setSide(mat.side);
+    this.drawGeometry(mesh);
+  }
+
   private drawBackground(sky: Sky): void {
     const gl = this.gl;
     const p = this.bgProgram;
@@ -760,7 +979,7 @@ export class Renderer {
     st.setColorMask(true);
   }
 
-  private renderDepthPrepass(viewProj: Matrix4): void {
+  private renderDepthPrepass(viewProj: Matrix4, withColor: boolean): void {
     const gl = this.gl;
     const st = this.state;
     const dp = this.depthPre!;
@@ -768,20 +987,25 @@ export class Renderer {
     st.setViewport(0, 0, dp.width, dp.height);
     st.setDepth(true, true);
     st.setBlend(0);
-    st.setColorMask(false);
+    st.setColorMask(withColor);
     gl.clear(gl.DEPTH_BUFFER_BIT);
+    if (withColor) {
+      gl.clearBufferfv(gl.COLOR, 0, ZERO4);
+      gl.clearBufferfv(gl.COLOR, 1, ZERO4);
+    }
     let bound: Program | null = null;
     for (let i = 0; i < this.opaque.length; i++) {
       const it = this.opaque[i];
       if (it.material.kind === 'unlit' && it.material.transparent) continue;
-      const prog = this.getDepthProgram(it.flags);
+      const prog = withColor ? this.getGBufProgram(it.flags) : this.getDepthProgram(it.flags);
       if (!this.ready(prog)) continue;
       if (prog !== bound) {
         prog.use();
-        gl.uniformMatrix4fv(prog.loc.uViewProj, false, viewProj.elements);
+        if (!withColor) gl.uniformMatrix4fv(prog.loc.uViewProj, false, viewProj.elements);
         bound = prog;
       }
-      this.drawDepthMesh(it.mesh, prog, it.flags);
+      if (withColor) this.drawGBufMesh(it.mesh, prog, it.flags);
+      else this.drawDepthMesh(it.mesh, prog, it.flags);
     }
     st.setColorMask(true);
   }
