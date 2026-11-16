@@ -261,8 +261,55 @@ uniform vec3 uSunE;
 uniform float uSunSize;
 in vec3 vDir;
 layout(location = 0) out vec4 fragColor;
+// ── night sky: stars (cell hashed on a shell, footprint-aware), Milky Way band, full moon ──
+vec3 stHash3(vec3 p) {
+  p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+  p += dot(p, p.yxz + 33.33);
+  return fract((p.xxy + p.yxx) * p.zyx);
+}
+float stNoise(vec3 x) {
+  vec3 i = floor(x), f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(stHash3(i).x, stHash3(i + vec3(1, 0, 0)).x, f.x), mix(stHash3(i + vec3(0, 1, 0)).x, stHash3(i + vec3(1, 1, 0)).x, f.x), f.y),
+             mix(mix(stHash3(i + vec3(0, 0, 1)).x, stHash3(i + vec3(1, 0, 1)).x, f.x), mix(stHash3(i + vec3(0, 1, 1)).x, stHash3(i + vec3(1, 1, 1)).x, f.x), f.y), f.z);
+}
+float gDirFw = 0.0;   // screen-space footprint of the view direction (computed in uniform control flow)
+vec3 starLayer(vec3 dir, float scale, float density, float size, float gain) {
+  vec3 p = dir * scale;
+  vec3 ip = floor(p);
+  vec3 h = stHash3(ip);
+  if (h.x > density) return vec3(0.0);
+  vec3 c = ip + 0.15 + 0.7 * stHash3(ip + 17.0);
+  float px = gDirFw * scale;
+  float r = max(size, px * 0.8);
+  float a = smoothstep(r, 0.0, length(p - c));
+  a *= min(1.0, (size * size) / (r * r));          // keep the energy of a star that is smaller than a pixel
+  vec3 tint = mix(vec3(1.0, 0.72, 0.5), vec3(0.62, 0.78, 1.0), stHash3(ip + 5.0).y);
+  return tint * a * gain * (0.25 + 5.0 * pow(h.y, 6.0));
+}
+vec3 nightSky(vec3 dir) {
+  vec3 s = starLayer(dir, 110.0, 0.20, 0.05, 1.0) + starLayer(dir, 55.0, 0.10, 0.06, 1.8) + starLayer(dir, 24.0, 0.05, 0.08, 3.0);
+  vec3 gn = normalize(vec3(0.35, 0.8, 0.45));
+  float band = exp(-pow(dot(dir, gn) / 0.16, 2.0));
+  float dust = stNoise(dir * 9.0) * 0.6 + stNoise(dir * 21.0) * 0.4;
+  s += vec3(0.55, 0.6, 0.8) * 0.045 * band * smoothstep(0.25, 0.9, dust);
+  return s;
+}
+vec3 moonDisc(vec3 dir, vec3 moonDir, out float alpha) {
+  float mr = 0.0105;
+  float ang = length(cross(dir, moonDir));
+  float inside = (1.0 - smoothstep(mr * 0.93, mr * 1.04, ang)) * step(0.0, dot(dir, moonDir));
+  vec3 mp = (dir - moonDir) / mr;
+  float maria = stNoise(mp * 2.2) * 0.65 + stNoise(mp * 5.0) * 0.35;
+  float tone = 0.72 + 0.5 * smoothstep(0.35, 0.7, maria) - 0.12 * stNoise(mp * 12.0);
+  float limb = 1.0 - 0.25 * smoothstep(0.55, 1.0, ang / mr);
+  alpha = inside;
+  vec3 glow = vec3(0.7, 0.8, 1.0) * 0.06 * exp(-ang * ang / (0.06 * 0.06)) * step(0.0, dot(dir, moonDir));
+  return vec3(1.0, 0.97, 0.9) * 2.6 * tone * limb * inside + glow;
+}
 void main() {
   vec3 dir = normalize(vDir);
+  gDirFw = length(fwidth(dir));
   vec3 col = textureLod(uSkyCube, dir, 0.0).rgb;
   vec4 cloud = vec4(0.0);
   if (uCloud.x > 0.001) {
@@ -278,6 +325,18 @@ void main() {
   float solid = PI * r * r;
   vec3 sunRadiance = min(uSunE / solid, vec3(20000.0));
   col += sunRadiance * disk * step(0.0, dir.y + 0.01) * (1.0 - cloud.a);
+  if (uCloud.w > 0.001) {
+    float darkness = exp(-dot(col, vec3(0.2126, 0.7152, 0.0722)) * 60.0);
+    if (darkness > 0.01 && dir.y > -0.02) {
+      float horizon = smoothstep(-0.02, 0.12, dir.y);
+      float ma;
+      vec3 moon = moonDisc(dir, -uSunDir, ma);
+      vec3 night = (nightSky(dir) + moon) * uCloud.w;
+      // the moon hides the stars behind it; clouds hide both
+      night = mix(night, moon * uCloud.w, ma);
+      col += night * darkness * horizon * (1.0 - cloud.a);
+    }
+  }
   fragColor = vec4(col, 1.0);
 }
 `;

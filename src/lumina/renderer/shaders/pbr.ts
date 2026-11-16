@@ -119,7 +119,7 @@ uniform sampler2D uDetailMap;
 uniform vec4 uDetail;        // x = tiling, y = normal strength, z = roughness amount, w = fade-out distance (m)
 #endif
 #ifdef USE_LAYERS
-uniform vec4 uLayers;        // x = wetness, y = dust, z = patch noise frequency (1/m)
+uniform vec4 uLayers;        // x = wetness, y = dust, z = patch noise frequency (1/m), w = snow
 uniform vec3 uDustColor;
 #endif
 #ifdef USE_DECALS
@@ -885,9 +885,21 @@ void main() {
     base.rgb = mix(base.rgb, uDustColor, dustAmt * 0.85);
     roughness = mix(roughness, max(roughness, 0.92), dustAmt);
     metalness *= 1.0 - dustAmt;
+    float snowAmt = 0.0;
+    if (uLayers.w > 0.001) {
+      // snow settles on up-facing surfaces, thicker in the cavities of the relief, and thins out along patchy noise
+      float sup = smoothstep(0.2, 0.75, Ng.y);
+      float sn = lFbm(vWorldPos * uLayers.z * 1.9 + 17.3);
+      snowAmt = smoothstep(0.25, 0.65, (uLayers.w * 1.5 - 0.35 + (sn - 0.5) * 0.9 + 0.45 * pomDepth01) * sup + 0.0);
+      snowAmt *= smoothstep(0.0, 0.08, uLayers.w);
+      base.rgb = mix(base.rgb, vec3(0.80, 0.84, 0.90), snowAmt);
+      roughness = mix(roughness, 0.62, snowAmt);
+      metalness *= 1.0 - snowAmt;
+      N = normalize(mix(N, normalize(mix(Ng, vec3(0.0, 1.0, 0.0), 0.35)), snowAmt * 0.85));
+    }
     float wl = uLayers.x;
     float wetMask = saturate(wl * 1.3 + (pn - 0.5) * 0.9 * smoothstep(0.0, 0.25, wl) + pomDepth01 * 0.5 * wl);
-    wetMask *= 1.0 - dustAmt * 0.5;
+    wetMask *= (1.0 - dustAmt * 0.5) * (1.0 - snowAmt);
     base.rgb = mix(base.rgb, pow(max(base.rgb, vec3(0.0)), vec3(1.75)), wetMask * (1.0 - metalness));   // wet dielectrics are darker + more saturated
     roughness = mix(roughness, 0.05 + 0.12 * roughness, wetMask);                                          // water film
     N = normalize(mix(N, Ng, wetMask * wetMask * 0.7));                                                     // water fills the micro relief
@@ -995,7 +1007,8 @@ void main() {
     vec3 Lv = pt.xyz - vWorldPos;
     float d2 = dot(Lv, Lv);
     vec3 L = Lv * inversesqrt(max(d2, 1e-8));
-    float att = 1.0 / max(d2, 1e-3);
+    float srcR = uLights[i].spot.w;
+    float att = 1.0 / max(d2, max(1e-3, srcR * srcR));
     if (cr.w > 0.0) {
       float r2 = d2 / (cr.w * cr.w);
       float win = saturate(1.0 - r2 * r2);
@@ -1019,7 +1032,28 @@ void main() {
         lr *= mix(1.0, sh, uPOM2.x * pomFadeK);
       }
 #endif
-      evalLight(s, L, lr, diffuse, specular);
+      if (srcR > 0.0) {
+        // sphere light (Karis 2013): diffuse from the centre, specular from the point of the sphere closest to the
+        // reflection ray, with a widened lobe and the (a / a')^2 energy normalisation
+        float dist = sqrt(d2);
+        vec3 Rr = reflect(-s.V, s.N);
+        vec3 cToRay = dot(Lv, Rr) * Rr - Lv;
+        vec3 closest = Lv + cToRay * saturate(srcR / max(length(cToRay), 1e-4));
+        vec3 Ls = normalize(closest);
+        float widen = saturate(srcR / (3.0 * max(dist, 1e-3)));
+        Surface s2 = s;
+        s2.a = saturate(s.a + widen);
+        s2.at = saturate(s.at + widen);
+        s2.ab = saturate(s.ab + widen);
+        float norm = s.a / max(s2.a, 1e-4);
+        vec3 unusedD = vec3(0.0);
+        vec3 specL = vec3(0.0);
+        evalLight(s, L, lr, diffuse, unusedD);
+        evalLight(s2, Ls, lr, unusedD, specL);
+        specular += specL * (norm * norm);
+      } else {
+        evalLight(s, L, lr, diffuse, specular);
+      }
     }
   }
 

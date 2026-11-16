@@ -88,6 +88,7 @@ export interface PBRMaterialParams {
   detailDistance?: number;
   wetness?: number;
   dust?: number;
+  snow?: number;
   dustColor?: number | string | Color;
   layerScale?: number;
   receiveDecals?: boolean;
@@ -209,6 +210,8 @@ export class PBRMaterial extends Material {
   wetness = 0;
   /** 0 … 1 – dust settled on up-facing surfaces (rougher, lighter, matte). */
   dust = 0;
+  /** 0 … 1 – snow cover: accumulates on up-facing surfaces and in cavities (white, matte, soft-normal). */
+  snow = 0;
   dustColor = new Color(0.55, 0.47, 0.37);
   /** Spatial frequency (1/m) of the wetness / dust patch noise. */
   layerScale = 0.8;
@@ -273,6 +276,7 @@ export class PBRMaterial extends Material {
     if (p.detailDistance !== undefined) this.detailDistance = p.detailDistance;
     if (p.wetness !== undefined) this.wetness = p.wetness;
     if (p.dust !== undefined) this.dust = p.dust;
+    if (p.snow !== undefined) this.snow = p.snow;
     if (p.dustColor !== undefined) this.dustColor.set(p.dustColor as Color);
     if (p.layerScale !== undefined) this.layerScale = p.layerScale;
     if (p.receiveDecals !== undefined) this.receiveDecals = p.receiveDecals;

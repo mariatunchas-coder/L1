@@ -1,6 +1,5 @@
 import type { DirectionalLight } from '../core/Lights';
 import type { Renderer } from '../renderer/Renderer';
-import type { DeviceProfile } from './Device';
 
 export type QualityLevel = 'low' | 'medium' | 'high' | 'ultra' | 'photo';
 
@@ -84,29 +83,6 @@ export function applyQuality(renderer: Renderer, level: QualityLevel, sun?: Dire
     case 'photo':
       return set({ msaa: 0, taa: true, ssao: true, ssr: true, ssgi: true, ssgiRays: 2, ssgiSteps: 24, refrSteps: 40, pom: 1, contact: true, fog: true, mb: false, flare: true, shadow: 4096, cascades: 4, scale: 1, sharpen: 0.3, ssrSteps: 128, fogSteps: 48, dofTaps: 56, local: 2048, cache: 48 });
   }
-}
-
-/**
- * Picks a preset from the detected hardware (`renderer.device`): phones and weak GPUs get a lower preset, MSAA off / 2×,
- * fewer parallax / refraction steps and the dynamic-resolution governor; desktop GPUs keep the full pipeline.
- * Call it once right after creating the renderer (and before building heavy geometry – see `device.geometryDetail`).
- */
-export function applyDeviceQuality(renderer: Renderer, sun?: DirectionalLight | null): DeviceProfile {
-  const d = renderer.device;
-  applyQuality(renderer, d.preset, sun);
-  if (d.tier !== 'high') {
-    renderer.parallax.quality = d.tier === 'low' ? 0.35 : 0.6;
-    renderer.post.refraction.steps = d.tier === 'low' ? 8 : 14;
-    renderer.post.bloom.enabled = true;
-    renderer.post.dof.taps = 14;
-    renderer.post.volumetricFog.steps = 12;
-    renderer.post.autoExposureMode = 'histogram';
-    renderer.environmentUpdateInterval = 250;
-    if (sun) sun.shadow.cascades = Math.min(sun.shadow.cascades, 2);
-    renderer.dynamicResolution = { enabled: true, targetFps: d.tier === 'low' ? 40 : 50, minScale: d.tier === 'low' ? 0.45 : 0.6, maxScale: d.tier === 'low' ? 0.8 : 1 };
-    renderer.renderScale = Math.min(renderer.renderScale, d.tier === 'low' ? 0.7 : 0.9);
-  }
-  return d;
 }
 
 interface Step {

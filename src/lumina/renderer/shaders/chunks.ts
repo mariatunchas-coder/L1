@@ -74,7 +74,7 @@ struct PunctualLight {
   vec4 posType;     // xyz = world position, w = 1 point / 2 spot
   vec4 colorRange;  // rgb = colour * intensity, w = range (0 = infinite)
   vec4 dirAngle;    // xyz = spot axis, w = cos(outer)
-  vec4 spot;        // x = 1 / (cos(inner) - cos(outer)), y = first shadow-atlas layer (-1 = no shadow), z = 1 → cube (point) shadow
+  vec4 spot;        // x = 1 / (cos(inner) - cos(outer)), y = first shadow-atlas layer (-1 = no shadow), z = 1 → cube (point) shadow, w = emitter radius (m, 0 = point)
 };
 struct DecalData {
   mat4 inv;         // world → decal space (box [-0.5, 0.5]^3, image on xy, projected along z)
@@ -230,7 +230,7 @@ float localShadowFactor(int li, vec3 wp, vec3 N, vec3 L, float dist, float noise
   // Procedural cumulus layer shared by the sky bake (image based lighting) and the background pass
   // (analytic, so the visible clouds stay razor sharp instead of being limited by cubemap resolution).
   clouds: /* glsl */ `
-uniform vec4 uCloud;          // x coverage, y density, z scale, w unused
+uniform vec4 uCloud;          // x coverage, y density, z scale, w night-sky star brightness
 uniform vec2 uCloudOffset;    // wind drift
 
 float cHash(vec2 p) {

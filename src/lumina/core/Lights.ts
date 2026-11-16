@@ -64,6 +64,16 @@ export class DirectionalLight extends Light {
   /** Aligns direction, colour and intensity with a Sky. */
   syncWithSky(sky: Sky): void {
     const l = sky.getSunLight();
+    // after sunset the moon (opposite the sun, full phase) takes over as the key light
+    const below = -sky.sunDirection.y; // sin(moon elevation)
+    const moonI = sky.moonLight > 0 ? 0.35 * sky.moonLight * Math.min(1, Math.max(0, (below - 0.03) / 0.2)) : 0;
+    if (moonI > l.intensity) {
+      this.position.copy(this.target).addScaled(sky.sunDirection, -100);
+      this.color.setRGB(0.55, 0.68, 1.0);
+      this.intensity = moonI;
+      this.visible = true;
+      return;
+    }
     this.position.copy(this.target).addScaled(sky.sunDirection, 100);
     this.color.copy(l.color);
     this.intensity = l.intensity;
@@ -74,6 +84,11 @@ export class DirectionalLight extends Light {
 export class PointLight extends Light {
   /** Influence radius in metres (0 = unlimited, pure inverse-square). */
   range: number;
+  /**
+   * Physical radius of the emitting sphere (m). 0 = ideal point. > 0 gives the large, soft specular highlight of a
+   * real lamp (representative-point sphere light, energy normalised) – a bulb, a softbox, a neon blob.
+   */
+  radius = 0;
   constructor(color: number | string | Color = 0xffffff, intensity = 10, range = 0) {
     super(color, intensity);
     this.type = 'PointLight';
@@ -88,6 +103,8 @@ export class SpotLight extends Light {
   /** 0 = hard edge, 1 = fully soft. */
   penumbra = 0.3;
   range: number;
+  /** Radius of the emitting disc / sphere (m); see `PointLight.radius`. */
+  radius = 0;
   constructor(color: number | string | Color = 0xffffff, intensity = 50, range = 0) {
     super(color, intensity);
     this.type = 'SpotLight';

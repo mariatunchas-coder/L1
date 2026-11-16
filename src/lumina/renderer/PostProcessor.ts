@@ -5,7 +5,7 @@ import { VoxelGI } from './VoxelGI';
 import { Program } from './Program';
 import { ColorTarget, GBufferTarget, createColorTarget, deleteColorTarget } from './RenderTarget';
 import { fullscreenVert } from './shaders/ibl';
-import { adaptFrag, bloomDownFrag, bloomUpFrag, compositeFrag, histAdaptFrag, histFrag, histVert, lensFlareFrag, lumFrag, ssaoBlurFrag, ssaoFrag } from './shaders/post';
+import { adaptFrag, bloomDownFrag, bloomUpFrag, compositeFrag, histAdaptFrag, histFrag, histVert, lensFlareFrag, lumFrag, gtaoFrag, ssaoBlurFrag, ssaoFrag } from './shaders/post';
 import { volumetricBlurFrag, volumetricFrag } from './shaders/volumetric';
 import { dofFrag, motionBlurFrag, ssgiApplyFrag, ssgiBlurFrag, ssgiTemporalFrag, ssgiTraceFrag, ssrApplyFrag, ssrTraceFrag, taaFrag } from './shaders/effects';
 import { TEX_CUBE } from './GLState';
@@ -34,7 +34,8 @@ export interface PostSettings {
   adaptSpeedDown: number;
   toneMapping: ToneMapping;
   bloom: { enabled: boolean; intensity: number; threshold: number; knee: number; radius: number; /** physically plausible: bloom redistributes energy instead of adding it */ energyConserving: boolean };
-  ssao: { enabled: boolean; radius: number; intensity: number; power: number; bias: number };
+  /** gtao: ground-truth horizon-based AO (default); false = legacy hemisphere SSAO. */
+  ssao: { enabled: boolean; radius: number; intensity: number; power: number; bias: number; gtao: boolean };
   vignette: number;
   grain: number;
   saturation: number;
@@ -46,6 +47,10 @@ export interface PostSettings {
   temperature: number;
   /** Barrel (+) / pincushion (−) lens distortion, typical ±0.15. */
   lensDistortion: number;
+  /** Film halation: bright highlights bleed a warm red-orange glow (light scattering inside the film base). 0 = off. */
+  halation: number;
+  /** Dust / smudges on the lens light up around bright sources (modulates the bloom). 0 = off. */
+  lensDirt: number;
   /** ASC CDL colour grade applied in display space (slope · offset · power per channel). */
   cdl: { enabled: boolean; slope: [number, number, number]; offset: [number, number, number]; power: [number, number, number] };
   /** Screen-space lens flare (ghosts + halo) driven by the bloom threshold. */
@@ -167,7 +172,7 @@ export function defaultPostSettings(): PostSettings {
     adaptSpeedDown: 1.2,
     toneMapping: 'aces',
     bloom: { enabled: true, intensity: 0.12, threshold: 1.2, knee: 0.6, radius: 0.72, energyConserving: false },
-    ssao: { enabled: true, radius: 0.7, intensity: 1.25, power: 1.35, bias: 0.03 },
+    ssao: { enabled: true, radius: 0.7, intensity: 1.0, power: 1.25, bias: 0.03, gtao: true },
     vignette: 0.28,
     grain: 0.08,
     saturation: 1.06,
@@ -176,6 +181,8 @@ export function defaultPostSettings(): PostSettings {
     sharpen: 0,
     temperature: 0,
     lensDistortion: 0,
+    halation: 0,
+    lensDirt: 0,
     cdl: { enabled: false, slope: [1, 1, 1], offset: [0, 0, 0], power: [1, 1, 1] },
     lensFlare: { enabled: false, intensity: 0.2, threshold: 8, ghosts: 5, dispersal: 0.32, halo: 0.42, chromatic: 0.012 },
     contactShadows: { enabled: false, length: 0.7, thickness: 0.5, strength: 0.85 },
@@ -207,6 +214,7 @@ const TONE_ID: Record<ToneMapping, number> = { none: 0, reinhard: 1, aces: 2, ne
 /** Screen-space effects: SSAO, bloom, auto-exposure, tone mapping & grading. */
 export class PostProcessor {
   private ssaoProg: Program;
+  private gtaoProg: Program;
   private ssaoBlurProg: Program;
   private bloomFirstProg: Program;
   private bloomDownProg: Program;
@@ -265,6 +273,7 @@ export class PostProcessor {
   constructor(private gl: WebGL2RenderingContext, private state: GLState) {
     const mk = (frag: string, name: string, defs: string[] = []) => new Program(gl, state, fullscreenVert, frag, defs, name).finalize();
     this.ssaoProg = mk(ssaoFrag, 'ssao');
+    this.gtaoProg = mk(gtaoFrag, 'gtao');
     this.ssaoBlurProg = mk(ssaoBlurFrag, 'ssaoBlur');
     this.bloomFirstProg = mk(bloomDownFrag, 'bloomFirst', ['FIRST_PASS']);
     this.bloomDownProg = mk(bloomDownFrag, 'bloomDown');
@@ -352,8 +361,9 @@ export class PostProcessor {
     this.begin();
     const P = camera.projectionMatrix.elements;
 
-    this.ssaoProg.use();
-    const L = this.ssaoProg.loc;
+    const aoProg = s.gtao ? this.gtaoProg : this.ssaoProg;
+    aoProg.use();
+    const L = aoProg.loc;
     this.state.bindTexture(0, TEX_2D, depthTex);
     gl.uniformMatrix4fv(L.uProj, false, P);
     gl.uniform4f(L.uProjInfo, 2 / P[0], 2 / P[5], -1 / P[0], -1 / P[5]);
@@ -768,8 +778,8 @@ export class PostProcessor {
     gl.uniform2f(L.uParams3, time % 100, w / h);
     gl.uniform2f(L.uParams4, Math.max(0, s.sharpen), Math.max(-1, Math.min(1, s.temperature)));
     gl.uniform1f(L.uFogEnabled, fogTex && s.volumetricFog.enabled ? 1 : 0);
-    gl.uniform4f(L.uParams5, flareTex && s.lensFlare.enabled ? Math.max(0, s.lensFlare.intensity) : 0, s.lensDistortion, s.cdl.enabled ? 1 : 0, 0);
-    gl.uniform4f(L.uParams6, Math.max(0, Math.min(1, s.opticalVignette)), s.bloom.energyConserving ? 1 : 0, s.exposureCompensation, 0);
+    gl.uniform4f(L.uParams5, flareTex && s.lensFlare.enabled ? Math.max(0, s.lensFlare.intensity) : 0, s.lensDistortion, s.cdl.enabled ? 1 : 0, bloomTex ? Math.max(0, s.halation) : 0);
+    gl.uniform4f(L.uParams6, Math.max(0, Math.min(1, s.opticalVignette)), s.bloom.energyConserving ? 1 : 0, s.exposureCompensation, bloomTex ? Math.max(0, s.lensDirt) : 0);
     gl.uniform3f(L.uSlope, s.cdl.slope[0], s.cdl.slope[1], s.cdl.slope[2]);
     gl.uniform3f(L.uOffset, s.cdl.offset[0], s.cdl.offset[1], s.cdl.offset[2]);
     gl.uniform3f(L.uPower, Math.max(0.05, s.cdl.power[0]), Math.max(0.05, s.cdl.power[1]), Math.max(0.05, s.cdl.power[2]));
@@ -783,6 +793,7 @@ export class PostProcessor {
     this.voxel?.dispose();
     for (const p of [
       this.ssaoProg,
+      this.gtaoProg,
       this.ssaoBlurProg,
       this.bloomFirstProg,
       this.bloomDownProg,

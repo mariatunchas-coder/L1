@@ -65,6 +65,117 @@ void main() {
 }
 `;
 
+/**
+ * Ground-Truth Ambient Occlusion (Jimenez et al. 2016, as used by modern AAA engines): per pixel, a few screen-space
+ * slices are searched for the two horizon angles; the cosine-weighted visible arc is integrated analytically.
+ * Much closer to the ray-traced reference than hemisphere sampling – no self-occlusion haloing, correct contact darkening.
+ */
+export const gtaoFrag = /* glsl */ `
+#include <common>
+uniform sampler2D uTex0;   // depth
+uniform mat4 uProj;
+uniform vec4 uProjInfo;    // (2/P00, 2/P11, -1/P00, -1/P11)
+uniform vec2 uNearFar;
+uniform vec2 uInvSize;     // 1 / full-res size
+uniform vec2 uInvOutSize;  // 1 / ao size
+uniform float uRadius;
+uniform float uBias;
+uniform float uIntensity;
+uniform float uPower;
+in vec2 vUv;
+out vec4 fragColor;
+
+#define GT_PI 3.14159265359
+#define GT_HALF_PI 1.57079632679
+#define GT_SLICES 4
+#define GT_STEPS 7
+
+float linZ(float d) {
+  float z = d * 2.0 - 1.0;
+  return 2.0 * uNearFar.x * uNearFar.y / (uNearFar.y + uNearFar.x - z * (uNearFar.y - uNearFar.x));
+}
+vec3 viewPosAt(vec2 uv) {
+  float lz = linZ(textureLod(uTex0, uv, 0.0).r);
+  return vec3((uv * uProjInfo.xy + uProjInfo.zw) * lz, -lz);
+}
+
+void main() {
+  vec2 uv = gl_FragCoord.xy * uInvOutSize;
+  float d = textureLod(uTex0, uv, 0.0).r;
+  if (d >= 1.0) { fragColor = vec4(1.0); return; }
+  vec3 P = viewPosAt(uv);
+  vec3 Pr = viewPosAt(uv + vec2(uInvSize.x, 0.0));
+  vec3 Pl = viewPosAt(uv - vec2(uInvSize.x, 0.0));
+  vec3 Pu = viewPosAt(uv + vec2(0.0, uInvSize.y));
+  vec3 Pd = viewPosAt(uv - vec2(0.0, uInvSize.y));
+  vec3 dx = abs(Pr.z - P.z) < abs(P.z - Pl.z) ? Pr - P : P - Pl;
+  vec3 dy = abs(Pu.z - P.z) < abs(P.z - Pd.z) ? Pu - P : P - Pd;
+  vec3 N = normalize(cross(dx, dy));
+  vec3 V = normalize(-P);
+  if (dot(N, V) < 0.0) N = -N;
+
+  float lz = -P.z;
+  // world radius → uv radius (per axis, so the sampling disc stays round on screen)
+  vec2 radiusUv = min(vec2(uProj[0][0], uProj[1][1]) * 0.5 * uRadius / lz, vec2(0.35));
+  float n1 = interleavedGradientNoise(gl_FragCoord.xy);
+  float n2 = interleavedGradientNoise(gl_FragCoord.xy + vec2(47.0, 13.0));
+  float falloffRange = 0.615 * uRadius;
+  float falloffMul = -1.0 / falloffRange;
+  float falloffAdd = uRadius * (1.0 - 0.615) / falloffRange + 1.0;
+
+  float vis = 0.0;
+  for (int i = 0; i < GT_SLICES; i++) {
+    float phi = (float(i) + n1) / float(GT_SLICES) * GT_PI;
+    vec2 om = vec2(cos(phi), sin(phi));
+    vec3 dirV = vec3(om, 0.0);
+    vec3 orthoDir = dirV - dot(dirV, V) * V;
+    vec3 axis = cross(dirV, V);
+    vec3 projN = N - axis * dot(N, axis);
+    float projLen = length(projN);
+    if (projLen < 1e-4) { vis += 1.0; continue; }
+    float signN = dot(orthoDir, projN) < 0.0 ? -1.0 : 1.0;
+    float cosN = saturate(dot(projN, V) / projLen);
+    float n = signN * acos(cosN);
+    float low0 = cos(n + GT_HALF_PI);
+    float low1 = cos(n - GT_HALF_PI);
+    float hc0 = low0;
+    float hc1 = low1;
+    for (int j = 0; j < GT_STEPS; j++) {
+      float s = (float(j) + n2) / float(GT_STEPS);
+      s *= s;
+      vec2 off = om * (radiusUv * s + uInvSize * 1.5);
+      vec2 uv0 = uv + off;
+      vec2 uv1 = uv - off;
+      if (uv0.x > 0.0 && uv0.y > 0.0 && uv0.x < 1.0 && uv0.y < 1.0) {
+        vec3 dd = viewPosAt(uv0) - P;
+        float len = length(dd);
+        float shc = dot(dd, V) / max(len, 1e-4);
+        shc = mix(low0, shc, saturate(len * falloffMul + falloffAdd));
+        hc0 = max(hc0, shc - uBias * 0.5 * step(len, uBias));
+      }
+      if (uv1.x > 0.0 && uv1.y > 0.0 && uv1.x < 1.0 && uv1.y < 1.0) {
+        vec3 dd = viewPosAt(uv1) - P;
+        float len = length(dd);
+        float shc = dot(dd, V) / max(len, 1e-4);
+        shc = mix(low1, shc, saturate(len * falloffMul + falloffAdd));
+        hc1 = max(hc1, shc - uBias * 0.5 * step(len, uBias));
+      }
+    }
+    float h0 = -acos(clamp(hc1, -1.0, 1.0));
+    float h1 = acos(clamp(hc0, -1.0, 1.0));
+    h0 = n + clamp(h0 - n, -GT_HALF_PI, GT_HALF_PI);
+    h1 = n + clamp(h1 - n, -GT_HALF_PI, GT_HALF_PI);
+    float sn = sin(n);
+    float iarc0 = (cosN + 2.0 * h0 * sn - cos(2.0 * h0 - n)) * 0.25;
+    float iarc1 = (cosN + 2.0 * h1 * sn - cos(2.0 * h1 - n)) * 0.25;
+    vis += projLen * (iarc0 + iarc1);
+  }
+  vis = saturate(vis / float(GT_SLICES));
+  float ao = saturate(1.0 - uIntensity * (1.0 - vis));
+  fragColor = vec4(pow(ao, uPower), 0.0, 0.0, 1.0);
+}
+`;
+
 export const ssaoBlurFrag = /* glsl */ `
 uniform sampler2D uTex0;   // depth
 uniform sampler2D uTex1;   // ao
@@ -287,8 +398,8 @@ uniform sampler2D uTex1;   // bloom
 uniform sampler2D uTex2;   // adapted luminance
 uniform sampler2D uTex3;   // volumetric fog: rgb in-scatter, a transmittance
 uniform sampler2D uTex4;   // lens flare
-uniform vec4 uParams5;     // x flare intensity, y lens distortion, z grade enabled
-uniform vec4 uParams6;     // x optical (cos^4) vignette, y energy-conserving bloom, z exposure compensation (EV)
+uniform vec4 uParams5;     // x flare intensity, y lens distortion, z grade enabled, w halation
+uniform vec4 uParams6;     // x optical (cos^4) vignette, y energy-conserving bloom, z exposure compensation (EV), w lens dirt
 uniform vec3 uSlope;       // ASC CDL (applied in display space)
 uniform vec3 uOffset;
 uniform vec3 uPower;
@@ -358,6 +469,27 @@ vec3 agx(vec3 color) {
   color = pow(max(color, vec3(0.0)), vec3(2.2));
   return clamp(fromRec2020 * color, 0.0, 1.0);
 }
+// procedural lens dirt: soft smudges + a few sharp dust specks, fixed to the lens (screen space)
+float dHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float dNoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(dHash(i), dHash(i + vec2(1.0, 0.0)), f.x), mix(dHash(i + vec2(0.0, 1.0)), dHash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float lensDirtMask(vec2 uv, float aspect) {
+  vec2 p = vec2(uv.x * aspect, uv.y);
+  float smudge = dNoise(p * 3.0) * 0.55 + dNoise(p * 7.0 + 11.0) * 0.3 + dNoise(p * 15.0 + 3.0) * 0.15;
+  smudge = smoothstep(0.45, 0.85, smudge);
+  vec2 g = p * 24.0;
+  vec2 gi = floor(g);
+  float spk = 0.0;
+  if (dHash(gi) > 0.86) {
+    vec2 c = gi + 0.25 + 0.5 * vec2(dHash(gi + 3.1), dHash(gi + 7.7));
+    float r = 0.08 + 0.2 * dHash(gi + 1.3);
+    spk = smoothstep(r, r * 0.4, length(g - c));
+  }
+  return clamp(smudge * 0.8 + spk, 0.0, 1.0);
+}
 vec3 toSRGB(vec3 c) {
   c = clamp(c, 0.0, 1.0);
   return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
@@ -398,8 +530,11 @@ void main() {
     col = max(col + dlt * uParams4.x, 0.0);
   }
 
-  if (uParams6.y > 0.5) col = mix(col, texture(uTex1, uv).rgb, clamp(uParams0.y, 0.0, 1.0));   // energy-conserving (physical) bloom
-  else col += texture(uTex1, uv).rgb * uParams0.y;
+  vec3 bloomC = texture(uTex1, uv).rgb;
+  if (uParams6.y > 0.5) col = mix(col, bloomC, clamp(uParams0.y, 0.0, 1.0));   // energy-conserving (physical) bloom
+  else col += bloomC * uParams0.y;
+  if (uParams5.w > 0.0) col += bloomC * vec3(1.0, 0.22, 0.06) * uParams5.w * 0.6;   // film halation
+  if (uParams6.w > 0.0) col += bloomC * lensDirtMask(uv, uParams3.y) * uParams6.w * 2.5;   // dirty lens
   if (uParams5.x > 0.0) col += texture(uTex4, uv).rgb * uParams5.x;
   col *= vec3(1.0 + 0.22 * uParams4.y, 1.0 + 0.02 * uParams4.y, 1.0 - 0.22 * uParams4.y);
 

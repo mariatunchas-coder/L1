@@ -42,6 +42,10 @@ export class Sky {
   cloudScale = 2.2;
   /** Wind drift in cloud-space units. Changing it never triggers an environment re-bake (only the visible clouds move). */
   readonly cloudOffset = { x: 0, y: 0 };
+  /** Night sky: star field + Milky Way brightness (0 = off). Only visible while the sky is dark. */
+  stars = 1;
+  /** Moonlight multiplier (0 = off): after sunset the scene's directional light switches to a cool, dim moon. */
+  moonLight = 1;
   /** Incremented whenever a parameter changes – the renderer rebakes the environment lazily. */
   version = 1;
 

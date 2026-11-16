@@ -6,7 +6,6 @@ import type { LOD } from '../core/LOD';
 import type { Object3D } from '../core/Object3D';
 import type { Scene } from '../core/Scene';
 import { DECAL_KINDS, type Decal } from '../core/Decal';
-import { detectDevice, type DeviceProfile } from '../quality/Device';
 import { Sky } from '../core/Sky';
 import { Frustum } from '../math/Bounds';
 import { clamp } from '../math/MathUtils';
@@ -174,8 +173,6 @@ export class Renderer {
   decalsEnabled = true;
   /** 0 … 1 – micro-shadowing of direct light by material cavities (ambient-occlusion maps, parallax cavities). */
   microShadowing = 0.6;
-  /** GPU class / mobile detection used for the automatic defaults (MSAA, pixel ratio) and by `applyDeviceQuality`. */
-  readonly device: DeviceProfile;
 
   readonly info: RenderInfo = {
     calls: 0,
@@ -285,9 +282,8 @@ export class Renderer {
       maxSamples: gl.getParameter(gl.MAX_SAMPLES) as number,
       gpu: dbg ? (gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) as string) : 'unknown',
     };
-    this.device = detectDevice(this.capabilities.gpu);
-    this.samples = Math.min(opts.samples ?? this.device.msaa, this.capabilities.maxSamples);
-    this.pixelRatio = opts.pixelRatio ?? Math.min(window.devicePixelRatio || 1, this.device.pixelRatioCap);
+    this.samples = Math.min(opts.samples ?? 4, this.capabilities.maxSamples);
+    this.pixelRatio = opts.pixelRatio ?? Math.min(window.devicePixelRatio || 1, 2);
 
     const on = (type: string, fn: EventListener) => {
       this.canvas.addEventListener(type, fn);
@@ -708,7 +704,7 @@ export class Renderer {
     if (gb && p.dof.enabled) cur = this.post_.dof(cur, gb, p.dof, rw, rh);
     if (gb && useGBuf && p.motionBlur.enabled) cur = this.post_.motionBlur(cur, gb, p.motionBlur, rw, rh);
 
-    const bloomTex = p.bloom.enabled || p.lensFlare.enabled ? this.post_.renderBloom(cur, p.bloom, rw, rh) : null;
+    const bloomTex = p.bloom.enabled || p.lensFlare.enabled || p.halation > 0 || p.lensDirt > 0 ? this.post_.renderBloom(cur, p.bloom, rw, rh) : null;
     const flareTex = p.lensFlare.enabled && bloomTex ? this.post_.renderLensFlare(p.lensFlare, rw, rh) : null;
     if (p.autoExposure) this.post_.updateAutoExposure(hdrTex, rw, rh, dt, p);
     this.post_.composite(cur, bloomTex, fogTex, flareTex, p, nowS, this.canvasW, this.canvasH);
@@ -938,7 +934,7 @@ export class Renderer {
       const heightOn = !!p.heightMap && this.parallax.enabled;
       if (heightOn) f |= F_HEIGHT;
       if (p.detailMap) f |= F_DETAIL;
-      if (p.layers || p.wetness > 0.001 || p.dust > 0.001) f |= F_LAYERS;
+      if (p.layers || p.wetness > 0.001 || p.dust > 0.001 || p.snow > 0.001) f |= F_LAYERS;
       if ((p.normalMap || p.anisotropy !== 0 || heightOn || p.detailMap) && mesh.geometry.attributes.tangent) f |= F_TANGENT;
       if (p.ormMap) f |= F_ORM;
       if (p.emissiveMap) f |= F_EMISSIVEMAP;
@@ -1127,7 +1123,7 @@ export class Renderer {
         }
         if (flags & F_DETAIL) gl.uniform4f(L.uDetail, Math.max(0.01, m.detailScale), m.detailNormalScale, m.detailRoughness, Math.max(0.5, m.detailDistance));
         if (flags & F_LAYERS) {
-          gl.uniform4f(L.uLayers, clamp(m.wetness, 0, 1), clamp(m.dust, 0, 1), Math.max(0.01, m.layerScale), 0);
+          gl.uniform4f(L.uLayers, clamp(m.wetness, 0, 1), clamp(m.dust, 0, 1), Math.max(0.01, m.layerScale), clamp(m.snow, 0, 1));
           gl.uniform3f(L.uDustColor, m.dustColor.r, m.dustColor.g, m.dustColor.b);
         }
         if (flags & F_SSREFRACT) {
@@ -1227,7 +1223,7 @@ export class Renderer {
     gl.uniform3f(p.loc.uSunDir, sky.sunDirection.x, sky.sunDirection.y, sky.sunDirection.z);
     gl.uniform3f(p.loc.uSunE, this.env.sunE.r, this.env.sunE.g, this.env.sunE.b);
     gl.uniform1f(p.loc.uSunSize, sky.sunDiskScale);
-    gl.uniform4f(p.loc.uCloud, this.env.cloudsActive ? sky.cloudCoverage : 0, sky.cloudDensity, sky.cloudScale, 0);
+    gl.uniform4f(p.loc.uCloud, this.env.cloudsActive ? sky.cloudCoverage : 0, sky.cloudDensity, sky.cloudScale, Math.max(0, sky.stars));
     gl.uniform2f(p.loc.uCloudOffset, sky.cloudOffset.x, sky.cloudOffset.y);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     this.info.calls++;
@@ -1443,6 +1439,7 @@ export class Renderer {
       const sLayer = this.ls.layerOf(l);
       d[o + 13] = sLayer;                              // spot.y: first shadow-atlas layer (−1 = none)
       d[o + 14] = l.type === 'PointLight' ? 1 : 0;     // spot.z: cube shadow
+      d[o + 15] = Math.max(0, (l as PointLight | SpotLight).radius || 0);   // spot.w: emitter radius (sphere light)
       if (l.type === 'SpotLight') {
         const sl = l as SpotLight;
         d[o + 3] = 2;

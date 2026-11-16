@@ -1,9 +1,11 @@
 /**
  * Lumina – a performance-first, physically based WebGL2 rendering engine.
  *
+ * Lumina Uber: GTAO, sphere area lights, automatic LOD generation (quadric-error clustering), snow layer, night sky
+ * (stars / moon / moonlight), film halation + lens dirt.
  * Lumina 4: world-space radiance cache + multi-bounce SSGI, PCSS soft shadows, spot / point light shadow atlas,
  * local-light volumetric god rays, histogram eye adaptation, detail maps, wet / dust layers, projected decals,
- * normal-map ⊕ parallax blending (RNM), arc-length UVs, automatic mobile optimisation.
+ * normal-map ⊕ parallax blending (RNM), arc-length UVs.
  * Features: PBR + IBL (sheen, anisotropy, iridescence, subsurface, refraction/transmission with dispersion, water),
  * parallax occlusion mapping, screen-space global illumination (SSGI),
  * cascaded + contact shadows, SSAO, SSR, TAA, DoF, motion blur, volumetric fog, procedural clouds,
@@ -50,11 +52,11 @@ export type { RendererOptions, RenderInfo } from './renderer/Renderer';
 export { defaultPostSettings } from './renderer/PostProcessor';
 export type { PostSettings, ToneMapping } from './renderer/PostProcessor';
 export { OrbitControls } from './controls/OrbitControls';
-export { applyQuality, applyDeviceQuality, AdaptiveQuality, QUALITY_LEVELS } from './quality/Quality';
-export { detectDevice } from './quality/Device';
-export type { DeviceProfile } from './quality/Device';
+export { applyQuality, AdaptiveQuality, QUALITY_LEVELS } from './quality/Quality';
 export { createDetailMap } from './textures/Detail';
 export type { LocalShadowSettings } from './renderer/LocalShadows';
 export type { QualityLevel } from './quality/Quality';
 export { mergeGeometries } from './util/Merge';
+export { simplifyGeometry, simplifyGeometryEx, createLODFromMesh, DEFAULT_LOD_CHAIN } from './util/Simplify';
+export type { SimplifyOptions, SimplifyResult, LODChainLevel } from './util/Simplify';
 export type { MergeItem } from './util/Merge';

@@ -1,3 +1,38 @@
+# Lumina Uber
+
+Uber is the "studio" release: more of the Unreal-Engine-5 toolbox, and a demo that no longer needs hundreds of thousands of triangles.
+
+| Feature | What it does | Switch |
+| --- | --- | --- |
+| **GTAO** | Ground-truth horizon-based AO (Jimenez 2016): 4 slices × 2×7 depth taps per half-res pixel, analytic cosine-weighted visibility, distance falloff, the existing depth-aware blur. Replaces hemisphere SSAO (still available) | `post.ssao.gtao`, `ssao.radius / intensity / power` |
+| **Sphere area lights** | `PointLight.radius` / `SpotLight.radius` – diffuse from the centre, specular from the closest point of the sphere to the reflection ray (Karis 2013), widened lobe and (a/a')² energy normalisation, near-field clamp | `light.radius` (m) |
+| **Auto-LOD (Nanite-style budget)** | `simplifyGeometry(geo, ratio)` / `simplifyGeometryEx` / `createLODFromMesh(mesh)`: quadric-error vertex clustering – QEM-placed vertices, UV seams and hard edges preserved, all float attributes averaged, triangle target found by bisection (e.g. 16 128 → 820 for ratio 0.05, bounding box intact). Distances scale with the bounding sphere | `createLODFromMesh(mesh, [{ ratio, distance }])` |
+| **Snow layer** | Settles on up-facing surfaces and in relief cavities (uses the POM depth), patchy noise, white / matte / soft normal, removes the wet film under it | `material.snow` |
+| **Night sky** | Footprint-aware procedural stars (3 layers), Milky Way band, full moon with maria; `DirectionalLight.syncWithSky()` hands the key light to a cool moonlight after sunset | `sky.stars`, `sky.moonLight` |
+| **Film halation / lens dirt** | Warm bloom bleed around highlights; procedural smudges and dust specks that light up near bright sources (screen-fixed) | `post.halation`, `post.lensDirt` |
+
+Removed: the automatic mobile / GPU-class detection (`detectDevice`, `renderer.device`, `applyDeviceQuality`). Defaults are fixed (MSAA 4×, pixel-ratio cap 2) and nothing is lowered behind your back. `AdaptiveQuality` and `renderer.dynamicResolution` remain as *opt-in* tools and are off by default.
+
+Demo: the scene is now ~74 k authored triangles (it was several hundred thousand plus up to 200 000 instanced rounded boxes); surface detail comes from parallax relief, detail maps and decals, distant detail from automatic LODs.
+
+```ts
+import { createLODFromMesh, PointLight } from './lumina';
+
+const lamp = new PointLight(0xffd9a0, 120, 20);
+lamp.radius = 0.3;                              // soft, round highlights on glossy surfaces
+
+const hero = createLODFromMesh(new Mesh(new SphereGeometry(1.5, 96, 48), mat));   // 3 simplified levels
+scene.add(hero);
+
+renderer.post.ssao.gtao = true;
+material.snow = 0.8;
+sky.setSun(-30, 140);  sun.syncWithSky(sky);    // moon + stars
+```
+
+Limits: vertex clustering is a distance-LOD tool (not topology-preserving edge collapse); the moon / stars are not baked into the IBL cube; sphere lights share the light shadow atlas with point / spot lights.
+
+---
+
 # Lumina 4
 
 Lumina 4 pushes the engine toward Unreal-Engine-5-style rendering inside WebGL2. Every item below is implemented,
@@ -25,15 +60,12 @@ exercised by the demo (tab **L4**) and verified headless (shader compile, zero `
   (`material.parallaxNormalBlend`, default 0.5; 0 = old "normal map only" behaviour).
 * **Multi-bounce SSGI** – see above.
 * **Parallax self-shadow** now also works toward the 3 brightest local lights (`material.parallaxLocalShadow`).
-* **Mobile** – `detectDevice()` / `renderer.device` classify the GPU (Adreno / Mali / PowerVR / software …). `Renderer` defaults to MSAA 0 / 2 / 4 and a pixel-ratio cap by tier,
-  `applyDeviceQuality(renderer, sun)` picks the preset + dynamic resolution, and the demo scales primitive segments and instance counts by `device.geometryDetail`.
 * Lights: stale `spot` data of point lights is cleared every frame; lights are ordered shadow-casters-first, then by distance.
 
 ```ts
-import { Renderer, Decal, PBRMaterial, createBricks, createDetailMap, applyDeviceQuality } from './lumina';
+import { Renderer, Decal, PBRMaterial, createBricks, createDetailMap } from './lumina';
 
-const renderer = new Renderer({ canvas });                // tier-aware defaults
-applyDeviceQuality(renderer, sun);                        // phones: lighter preset automatically
+const renderer = new Renderer({ canvas });                // MSAA 4×, pixel ratio ≤ 2 (no automatic downgrades)
 
 spot.castShadow = true;                                   // shadow atlas + god rays
 renderer.post.ssgi.enabled = true;                        // multi-bounce + world cache are on by default
