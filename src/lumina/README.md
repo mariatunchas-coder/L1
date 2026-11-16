@@ -1,3 +1,43 @@
+# Lumina X
+
+Lumina X is the "studio" release: the engine now ships a full **atmosphere + weather + city toolkit** and the demo is a
+1.15 km procedural city that is drawn from **~1 000 unique triangles** (≈ 60 000 with every instance counted) – windows,
+curbs, lane markings and lit rooms are textures + parallax relief, not geometry.
+
+| Feature | What it does | Switch |
+| --- | --- | --- |
+| **Volumetric Fog X** | Half-res ray march with animated 3D fbm density (wind-driven wisps), separate ground-mist layer, sun god rays through the shadow cascades with an analytic sun-column transmittance, **multiple scattering** (Wrenninge octaves), sky **ambient in-scattering** (`Sky.getAmbient()`), point / spot light shafts with fog-attenuated phase, quadratic step distribution (dense near the camera), per-frame jitter + **temporal accumulation** (reprojection + 3×3 neighbourhood clamp) + depth-aware blur | `post.volumetricFog.{noise, noiseScale, windX/Z, multiScatter, mistDensity, mistFalloff, ambient, albedo, temporal, stepExponent}` |
+| **Screen-space rain** | Three parallax layers of streaks that are lit by what is behind them (scene + bloom of lamps): glow in light cones, vanish in the dark | `post.rain` |
+| **Global weather** | `renderer.weather.wetness` wets every material with `weatherResponse > 0` (cavities / puddles first, darker + glossier) | `renderer.weather.wetness`, `material.weatherResponse` |
+| **TimeOfDay** | Real solar position from clock + latitude + day of year, drives Sky + sun/moon, exposes `night` / `lamps` factors; re-bakes the IBL only when the sun moved > `minRebakeDegrees` | `new TimeOfDay(sky, sun)` |
+| **FlyControls / CameraPath** | WASD + mouse-look free flight (damped, ground clamp) and an arc-length Catmull-Rom cinematic rail with look-ahead and per-key fov | `FlyControls`, `CameraPath` |
+| **Urban textures** | `createFacade('concrete' \| 'glass')` (recessed windows, frames, mullions, sills, blinds, curtains, per-window lighting as emissive map, roof-membrane patch), `createRoadTile()` (asphalt wear, wheel tracks, lane lines, zebra crossings, manholes, curbs as relief, paving), `createLeaves()` | `FACADE`, `ROAD` constants |
+| **Lean architecture** | `createBuildingGeometry` (tiers, uvs in metres of the facade tile → windows keep their size on every face), `createCarGeometry` (~150 tris), `createLampGeometry`, `createTreeGeometry` | `makeRng(seed)` |
+
+Removed: the automatic mobile / GPU detection (`quality/Device.ts`). Nothing is lowered behind your back; quality presets are plain `Settings` patches you can see and edit.
+
+## Demo (`src/demo`)
+
+* `city.ts` – 12 × 12 blocks, **one ground quad** (road tile with parallax curbs), 17 building variants instanced per 3 × 3-block chunk (frustum culling), parked cars, 576 street lamps, parks, 220 projected decals (puddles grow with the wetness), a pool of 20 spot lights that always sits on the lamps nearest to the camera (cones show up as god rays in the fog), cinematic rail computed from the street grid.
+* `world.ts` – renderer, TimeOfDay, three camera modes (rail / fly / orbit), `apply(settings)` mapping every control to the engine.
+* `settings.ts` – all settings, atmosphere presets (Golden Hour, Siang Cerah, Fajar Berkabut, Blue Hour, Malam Hujan Neon, Badai Sore), quality presets. A configuration can be shared with `?s={"hour":22,"rain":true}`; `?lite` builds a small 6 × 6 city with small textures.
+
+```ts
+import { Renderer, Scene, Sky, DirectionalLight, TimeOfDay, FlyControls } from './lumina';
+
+const tod = new TimeOfDay(scene.sky!, sun);  tod.hour = 18.4;  tod.latitude = 35;
+renderer.post.volumetricFog.enabled = true;
+renderer.post.volumetricFog.noise = 0.5;          // drifting wisps
+renderer.post.volumetricFog.mistDensity = 0.003;  // ground mist
+renderer.post.rain.enabled = true;
+renderer.weather.wetness = 0.8;                   // materials with weatherResponse > 0
+loop: tod.update(dt); renderer.render(scene, camera);
+```
+
+Limits: fog history is reprojected at the surface / far point of each ray (fast camera cuts need `renderer.resetTemporal()`); rain is a screen-space layer (no 3D drops or splashes); the radiance cache and SSGI only know what the camera has seen; the city tile repeats every 96 m (variation comes from instances, decals and the world-space wet / dust noise).
+
+---
+
 # Lumina Uber
 
 Uber is the "studio" release: more of the Unreal-Engine-5 toolbox, and a demo that no longer needs hundreds of thousands of triangles.

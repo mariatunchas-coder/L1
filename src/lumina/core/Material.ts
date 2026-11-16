@@ -93,6 +93,8 @@ export interface PBRMaterialParams {
   layerScale?: number;
   receiveDecals?: boolean;
   layers?: boolean;
+  /** Lumina X – 0 … 1 – how strongly the renderer's global `weather.wetness` wets this material (0 = ignores the weather). */
+  weatherResponse?: number;
 }
 
 /**
@@ -219,6 +221,8 @@ export class PBRMaterial extends Material {
   receiveDecals = true;
   /** Always compile the wet / dust layer code (so `wetness` / `dust` can be animated from 0 without a shader switch). */
   layers = false;
+  /** Lumina X – how strongly `renderer.weather.wetness` (rain, puddles) affects this material; 0 = not at all. Compiles the layer code when > 0. */
+  weatherResponse = 0;
 
   constructor(p: PBRMaterialParams = {}) {
     super();
@@ -281,6 +285,7 @@ export class PBRMaterial extends Material {
     if (p.layerScale !== undefined) this.layerScale = p.layerScale;
     if (p.receiveDecals !== undefined) this.receiveDecals = p.receiveDecals;
     if (p.layers !== undefined) this.layers = p.layers;
+    if (p.weatherResponse !== undefined) this.weatherResponse = p.weatherResponse;
   }
 
   /** True when the material refracts the scene behind it (drawn after the opaque pass). */

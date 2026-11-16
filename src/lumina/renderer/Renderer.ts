@@ -136,6 +136,7 @@ const HALTON: [number, number][] = (() => {
   };
   return Array.from({ length: 16 }, (_, i) => [h(i + 1, 2), h(i + 1, 3)] as [number, number]);
 })();
+const DEFAULT_AMBIENT: [number, number, number] = [0.25, 0.3, 0.4];
 const _tmp = new Vector3();
 const _sunDir = new Vector3();
 const _frustum = new Frustum();
@@ -171,6 +172,8 @@ export class Renderer {
   localShadows: LocalShadowSettings = defaultLocalShadowSettings();
   /** Projected decals (see `Decal`): the closest 8 are used. */
   decalsEnabled = true;
+  /** Lumina X – global weather: `wetness` (0 … 1) wets every material whose `weatherResponse` > 0 (puddles fill cavities first, surfaces darken and turn glossy). */
+  readonly weather = { wetness: 0 };
   /** 0 … 1 – micro-shadowing of direct light by material cavities (ambient-occlusion maps, parallax cavities). */
   microShadowing = 0.6;
 
@@ -684,9 +687,14 @@ export class Renderer {
           p.volumetricFog,
           p.volumetricFog.localLights ? Math.min(this.sortedLights.length, Math.min(12, this.localShadows.maxFogLights)) : 0,
           rw,
-          rh
+          rh,
+          nowS,
+          this.frameCount,
+          scene.sky ? scene.sky.getAmbient() : DEFAULT_AMBIENT,
+          this.temporalReset
         )
       : null;
+    if (!fogTex) this.post_.resetFog();
 
     // ── G-buffer driven effects: SSR → TAA → DoF → motion blur (each reads the previous result) ──
     let cur = hdrTex;
@@ -934,7 +942,7 @@ export class Renderer {
       const heightOn = !!p.heightMap && this.parallax.enabled;
       if (heightOn) f |= F_HEIGHT;
       if (p.detailMap) f |= F_DETAIL;
-      if (p.layers || p.wetness > 0.001 || p.dust > 0.001 || p.snow > 0.001) f |= F_LAYERS;
+      if (p.layers || p.weatherResponse > 0 || p.wetness > 0.001 || p.dust > 0.001 || p.snow > 0.001) f |= F_LAYERS;
       if ((p.normalMap || p.anisotropy !== 0 || heightOn || p.detailMap) && mesh.geometry.attributes.tangent) f |= F_TANGENT;
       if (p.ormMap) f |= F_ORM;
       if (p.emissiveMap) f |= F_EMISSIVEMAP;
@@ -1123,7 +1131,7 @@ export class Renderer {
         }
         if (flags & F_DETAIL) gl.uniform4f(L.uDetail, Math.max(0.01, m.detailScale), m.detailNormalScale, m.detailRoughness, Math.max(0.5, m.detailDistance));
         if (flags & F_LAYERS) {
-          gl.uniform4f(L.uLayers, clamp(m.wetness, 0, 1), clamp(m.dust, 0, 1), Math.max(0.01, m.layerScale), clamp(m.snow, 0, 1));
+          gl.uniform4f(L.uLayers, clamp(m.wetness + (1 - m.wetness) * clamp(this.weather.wetness, 0, 1) * clamp(m.weatherResponse, 0, 1), 0, 1), clamp(m.dust, 0, 1), Math.max(0.01, m.layerScale), clamp(m.snow, 0, 1));
           gl.uniform3f(L.uDustColor, m.dustColor.r, m.dustColor.g, m.dustColor.b);
         }
         if (flags & F_SSREFRACT) {

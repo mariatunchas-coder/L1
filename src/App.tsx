@@ -1,1340 +1,502 @@
-import { useEffect, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button, ColorField, Note, Section, Segmented, Select, Slider, Stat, Tabs, Toggle } from './components/ui';
-import { createShowcase, type ModelInfo, type ModelSource, type PickResult, type Showcase } from './demo/buildScene';
+import { CityWorld } from './demo/world';
+import { DEFAULTS, LOOKS, PRESETS, QUALITY_PATCH, STORAGE_KEY, loadSettings, type CameraMode, type QualityId, type Settings } from './demo/settings';
 import type { ToneMapping } from './lumina';
 
-interface Settings {
-  // langit
-  elevation: number;
-  azimuth: number;
-  fog: number;
-  // cahaya
-  shadows: boolean;
-  shadowSize: number;
-  cascades: number;
-  softness: number;
-  ssao: boolean;
-  volFog: boolean;
-  volFogDensity: number;
-  volFogHeightFalloff: number;
-  volFogAnisotropy: number;
-  volFogIntensity: number;
-  // kamera
-  exposure: number;
-  autoExposure: boolean;
-  tone: ToneMapping;
-  bloom: boolean;
-  bloomIntensity: number;
-  // AA & efek
-  msaa: number;
-  taa: boolean;
-  taaFeedback: number;
-  taaJitter: number;
-  sharpen: number;
-  ssr: boolean;
-  ssrIntensity: number;
-  ssrDistance: number;
-  ssrThickness: number;
-  ssrRough: number;
-  ssrSteps: number;
-  dof: boolean;
-  dofFocus: number;
-  dofFocal: number;
-  dofFStop: number;
-  dofBlur: number;
-  dofClick: boolean;
-  mb: boolean;
-  mbIntensity: number;
-  // grading
-  vignette: number;
-  grain: number;
-  saturation: number;
-  contrast: number;
-  chroma: number;
-  temperature: number;
-  // performa
-  scale: number;
-  // scene
-  animate: boolean;
-  autoRotate: boolean;
-  props: boolean;
-  modelFit: number;
-  modelLights: boolean;
-  // awan
-  clouds: number;
-  cloudDensity: number;
-  cloudScale: number;
-  cloudDrift: boolean;
-  // efek baru
-  contact: boolean;
-  contactLength: number;
-  contactStrength: number;
-  flare: boolean;
-  flareIntensity: number;
-  flareThreshold: number;
-  flareGhosts: number;
-  lensDistortion: number;
-  look: string;
-  // air kolam
-  waterWaves: number;
-  waterScale: number;
-  waterSpeed: number;
-  waterClarity: number;
-  waterColor: string;
-  // Lumina 3: SSGI
-  ssgi: boolean;
-  ssgiIntensity: number;
-  ssgiRadius: number;
-  ssgiRays: number;
-  ssgiSteps: number;
-  ssgiBlur: number;
-  ssgiDebug: boolean;
-  // refraksi & dispersi
-  refrSS: boolean;
-  refrBend: number;
-  refrSteps: number;
-  dispersion: number;
-  // parallax occlusion mapping
-  pom: boolean;
-  pomQuality: number;
-  pomDepth: number;
-  pomShadow: number;
-  pomAO: number;
-  pomSteps: number;
-  // Lumina 4
-  histExposure: boolean;
-  exposureCenter: number;
-  exposureComp: number;
-  opticalVignette: number;
-  energyBloom: boolean;
-  ssgiBounce: boolean;
-  ssgiCache: boolean;
-  ssgiCacheExtent: number;
-  ssgiCacheRes: number;
-  ssgiCacheStrength: number;
-  pcss: boolean;
-  sunPenumbra: number;
-  microShadow: number;
-  localShadows: boolean;
-  localShadowSize: number;
-  localShadowSoft: number;
-  fogLocal: boolean;
-  fogLocalIntensity: number;
-  wetness: number;
-  dust: number;
-  decals: boolean;
-  detail: number;
-  detailRough: number;
-  detailTiling: number;
-  pomBlend: number;
-  pomLocalShadow: boolean;
-  // Lumina Uber
-  gtao: boolean;
-  gtaoRadius: number;
-  gtaoIntensity: number;
-  halation: number;
-  lensDirt: number;
-  autoFocus: boolean;
-  snow: number;
-  stars: number;
-  moon: number;
-  bulbRadius: number;
-  neonRadius: number;
-  spotRadius: number;
-  lodScale: number;
+// ───────────────────────── declarative control specs ─────────────────────────
+type Spec =
+  | { kind: 'range'; k: keyof Settings; label: string; min: number; max: number; step: number; hint?: string; fmt?: (v: number) => string }
+  | { kind: 'toggle'; k: keyof Settings; label: string; hint?: string }
+  | { kind: 'color'; k: keyof Settings; label: string }
+  | { kind: 'select'; k: keyof Settings; label: string; options: { label: string; value: string }[] };
+
+const R = (k: keyof Settings, label: string, min: number, max: number, step: number, hint?: string, fmt?: (v: number) => string): Spec => ({ kind: 'range', k, label, min, max, step, hint, fmt });
+const T = (k: keyof Settings, label: string, hint?: string): Spec => ({ kind: 'toggle', k, label, hint });
+const C = (k: keyof Settings, label: string): Spec => ({ kind: 'color', k, label });
+const S = (k: keyof Settings, label: string, options: { label: string; value: string }[]): Spec => ({ kind: 'select', k, label, options });
+
+interface Group {
+  title: string;
+  open?: boolean;
+  note?: string;
+  items: Spec[];
 }
 
-const DEFAULTS: Settings = {
-  elevation: 38,
-  azimuth: 140,
-  fog: 1.7,
-  shadows: true,
-  shadowSize: 2048,
-  cascades: 3,
-  softness: 1.6,
-  ssao: true,
-  volFog: false,
-  volFogDensity: 0.02,
-  volFogHeightFalloff: 0.05,
-  volFogAnisotropy: 0.6,
-  volFogIntensity: 1,
-  exposure: 1,
-  autoExposure: true,
-  tone: 'agx',
-  bloom: true,
-  bloomIntensity: 0.12,
-  msaa: 4,
-  taa: false,
-  taaFeedback: 0.9,
-  taaJitter: 1,
-  sharpen: 0,
-  ssr: false,
-  ssrIntensity: 1,
-  ssrDistance: 40,
-  ssrThickness: 0.6,
-  ssrRough: 0.6,
-  ssrSteps: 64,
-  dof: false,
-  dofFocus: 12,
-  dofFocal: 50,
-  dofFStop: 2.8,
-  dofBlur: 12,
-  dofClick: true,
-  mb: false,
-  mbIntensity: 0.5,
-  vignette: 0.28,
-  grain: 0.08,
-  saturation: 1.06,
-  contrast: 1.04,
-  chroma: 0,
-  temperature: 0,
-  scale: 1,
-  animate: true,
-  autoRotate: false,
-  props: true,
-  modelFit: 5,
-  modelLights: true,
-  clouds: 0.35,
-  cloudDensity: 1,
-  cloudScale: 2.2,
-  cloudDrift: false,
-  contact: true,
-  contactLength: 0.7,
-  contactStrength: 0.85,
-  flare: false,
-  flareIntensity: 0.2,
-  flareThreshold: 8,
-  flareGhosts: 5,
-  lensDistortion: 0,
-  look: 'none',
-  waterWaves: 0.035,
-  waterScale: 1,
-  waterSpeed: 1,
-  waterClarity: 2.2,
-  waterColor: '#3aa7a8',
-  ssgi: true,
-  ssgiIntensity: 1.8,
-  ssgiRadius: 6,
-  ssgiRays: 1,
-  ssgiSteps: 16,
-  ssgiBlur: 3,
-  ssgiDebug: false,
-  refrSS: true,
-  refrBend: 0.4,
-  refrSteps: 24,
-  dispersion: 1,
-  pom: true,
-  pomQuality: 1,
-  pomDepth: 1,
-  pomShadow: 1,
-  pomAO: 0.5,
-  pomSteps: 40,
-  histExposure: true,
-  exposureCenter: 0.6,
-  exposureComp: 0,
-  opticalVignette: 0.35,
-  energyBloom: false,
-  ssgiBounce: true,
-  ssgiCache: true,
-  ssgiCacheExtent: 40,
-  ssgiCacheRes: 32,
-  ssgiCacheStrength: 1,
-  pcss: true,
-  sunPenumbra: 0.02,
-  microShadow: 0.6,
-  localShadows: true,
-  localShadowSize: 1024,
-  localShadowSoft: 1.6,
-  fogLocal: true,
-  fogLocalIntensity: 1,
-  wetness: 0.25,
-  dust: 0.12,
-  decals: true,
-  detail: 0.7,
-  detailRough: 0.3,
-  detailTiling: 14,
-  pomBlend: 0.5,
-  pomLocalShadow: true,
-  gtao: true,
-  gtaoRadius: 0.8,
-  gtaoIntensity: 1,
-  halation: 0.15,
-  lensDirt: 0,
-  autoFocus: false,
-  snow: 0,
-  stars: 1,
-  moon: 1,
-  bulbRadius: 0.3,
-  neonRadius: 0.35,
-  spotRadius: 0.25,
-  lodScale: 1,
+const f0 = (v: number) => v.toFixed(0);
+const f1 = (v: number) => v.toFixed(1);
+const f3 = (v: number) => v.toFixed(3);
+const f4 = (v: number) => v.toFixed(4);
+const pct = (v: number) => Math.round(v * 100) + '%';
+const hh = (v: number) => {
+  const h = Math.floor(v),
+    m = Math.round((v - h) * 60);
+  return String(m === 60 ? (h + 1) % 24 : h).padStart(2, '0') + ':' + String(m === 60 ? 0 : m).padStart(2, '0');
 };
 
-const STORAGE_KEY = 'lumina.uber.settings.v1';
+const TABS = [
+  { id: 'scene', label: 'Suasana' },
+  { id: 'fog', label: 'Kabut X' },
+  { id: 'light', label: 'Cahaya' },
+  { id: 'lens', label: 'Lensa' },
+  { id: 'engine', label: 'Engine' },
+] as const;
+type Tab = (typeof TABS)[number]['id'];
 
-/** Merges untrusted JSON into the defaults, keeping only keys of the right type. */
-function sanitize(raw: unknown): Settings {
-  const out: Settings = { ...DEFAULTS };
-  if (!raw || typeof raw !== 'object') return out;
-  const o = raw as Record<string, unknown>;
-  for (const k of Object.keys(DEFAULTS) as (keyof Settings)[]) {
-    if (typeof o[k] === typeof DEFAULTS[k] && (typeof o[k] !== 'number' || Number.isFinite(o[k] as number))) (out as unknown as Record<string, unknown>)[k] = o[k];
-  }
-  return out;
-}
-function loadSettings(): Settings {
-  try {
-    const t = localStorage.getItem(STORAGE_KEY);
-    return t ? sanitize(JSON.parse(t)) : DEFAULTS;
-  } catch {
-    return DEFAULTS;
-  }
-}
-
-const QUALITY: { name: string; patch: Partial<Settings> }[] = [
-  { name: 'Rendah', patch: { localShadows: false, ssgiCache: false, fogLocal: false, ssgi: false, pomQuality: 0.5, refrSteps: 12, msaa: 0, taa: false, ssao: false, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 1024, cascades: 2, scale: 0.75, volFog: false, bloom: true, sharpen: 0 } },
-  { name: 'Sedang', patch: { localShadows: true, localShadowSize: 512, ssgiCache: false, fogLocal: false, ssgi: false, pomQuality: 0.7, refrSteps: 16, msaa: 2, taa: false, ssao: true, ssr: false, contact: false, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0 } },
-  { name: 'Tinggi', patch: { localShadows: true, localShadowSize: 1024, ssgiCache: false, fogLocal: true, ssgi: true, ssgiRays: 1, ssgiSteps: 14, pomQuality: 1, refrSteps: 24, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: false, shadowSize: 2048, cascades: 3, scale: 1, volFog: false, sharpen: 0.25 } },
-  { name: 'Ultra', patch: { localShadows: true, localShadowSize: 1024, ssgiCache: true, ssgiCacheRes: 32, fogLocal: true, ssgi: true, ssgiRays: 1, ssgiSteps: 16, pomQuality: 1, refrSteps: 28, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: false, dof: false, mb: true, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.25 } },
-  { name: 'Foto', patch: { localShadows: true, localShadowSize: 2048, ssgiCache: true, ssgiCacheRes: 48, fogLocal: true, ssgi: true, ssgiRays: 2, ssgiSteps: 24, pomQuality: 1, refrSteps: 40, msaa: 0, taa: true, ssao: true, ssr: true, contact: true, flare: true, dof: true, mb: false, shadowSize: 4096, cascades: 4, scale: 1, volFog: true, sharpen: 0.3, tone: 'agx' } },
-];
-
-type V3 = [number, number, number];
-const LOOKS: Record<string, { slope: V3; offset: V3; power: V3 } | null> = {
-  none: null,
-  warm: { slope: [1.06, 1.0, 0.9], offset: [0.01, 0.005, -0.01], power: [0.97, 1, 1.04] },
-  teal: { slope: [1.1, 1.0, 0.86], offset: [-0.015, 0, 0.03], power: [0.94, 1, 1.1] },
-  cool: { slope: [0.95, 1.0, 1.08], offset: [0, 0, 0.01], power: [1.05, 1, 0.96] },
-  fade: { slope: [0.92, 0.92, 0.95], offset: [0.06, 0.06, 0.07], power: [1, 1, 1] },
+const GROUPS: Record<Exclude<Tab, 'engine'>, Group[]> = {
+  scene: [
+    {
+      title: 'Waktu (astronomis)',
+      open: true,
+      items: [
+        R('hour', 'Jam', 0, 24, 0.01, 'matahari / bulan / bintang', hh),
+        R('timeScale', 'Kecepatan waktu', 0, 1.5, 0.01, 'jam game / detik', (v) => (v === 0 ? 'jeda' : v.toFixed(2) + ' j/d')),
+        R('latitude', 'Lintang', -60, 60, 1, '°', f0),
+        R('dayOfYear', 'Hari dalam tahun', 1, 365, 1, '172 = Juni', f0),
+        R('azimuthOffset', 'Putar mata angin', -180, 180, 1, '°', f0),
+      ],
+    },
+    {
+      title: 'Langit & awan',
+      items: [R('clouds', 'Tutupan awan', 0, 1, 0.01, undefined, pct), R('cloudDensity', 'Kepadatan awan', 0.2, 2, 0.01), R('cloudScale', 'Skala awan', 0.8, 5, 0.05), R('cloudDrift', 'Angin awan', 0, 0.2, 0.002, undefined, f3), R('stars', 'Bintang & Bima Sakti', 0, 3, 0.05), R('moon', 'Cahaya bulan', 0, 3, 0.05)],
+    },
+    {
+      title: 'Cuaca',
+      open: true,
+      items: [T('rain', 'Hujan', 'goresan 3 lapis, menangkap cahaya lampu'), R('rainIntensity', 'Intensitas hujan', 0, 1, 0.01, undefined, pct), R('rainWind', 'Angin hujan', -1, 1, 0.01), R('wetness', 'Basah / genangan', 0, 1, 0.01, 'aspal, dinding, kolam', pct)],
+    },
+    {
+      title: 'Atmosfer (aerial perspective)',
+      items: [R('fog', 'Kepadatan kabut jauh', 0, 40, 0.1, '×10⁻⁴ /m', f1), R('fogHeight', 'Penurunan terhadap tinggi', 0, 0.1, 0.001, undefined, f3)],
+    },
+  ],
+  fog: [
+    {
+      title: 'Volumetric Fog X',
+      open: true,
+      note: 'Integrasi cahaya 3D per-piksel: berkas matahari lewat cascade shadow, spot lampu jalan, multi-scatter, ambient langit, noise 3D bergerak, akumulasi temporal.',
+      items: [
+        T('volFog', 'Aktif'),
+        R('volDensity', 'Kepadatan', 0, 25, 0.05, '×10⁻³ /m', f1),
+        R('volHeightFalloff', 'Turun terhadap tinggi', 0, 0.12, 0.001, '1/m', f3),
+        R('volBase', 'Tinggi dasar', -20, 60, 1, 'm', f0),
+        R('volMax', 'Jarak maksimum', 60, 1500, 10, 'm', f0),
+        R('volIntensity', 'Intensitas cahaya', 0, 5, 0.01),
+        R('volAnisotropy', 'Anisotropi (god rays)', -0.9, 0.95, 0.01, 'g'),
+      ],
+    },
+    {
+      title: 'Struktur & gerak',
+      open: true,
+      items: [R('volNoise', 'Gumpalan (noise 3D)', 0, 1, 0.01, undefined, pct), R('volNoiseScale', 'Frekuensi gumpalan', 0.003, 0.12, 0.001, '1/m', f3), R('volWind', 'Kecepatan angin', 0, 20, 0.1, 'm/s', f1), R('volWindDir', 'Arah angin', 0, 360, 1, '°', f0)],
+    },
+    {
+      title: 'Kabut tanah (mist)',
+      items: [R('volMist', 'Kepadatan', 0, 25, 0.05, '×10⁻³ /m', f1), R('volMistFalloff', 'Ketebalan (turun /m)', 0.01, 0.6, 0.005, undefined, f3)],
+    },
+    {
+      title: 'Cahaya di dalam kabut',
+      items: [R('volMulti', 'Multi-scatter', 0, 1, 0.01, 'Wrenninge', pct), R('volAmbient', 'Ambient langit', 0, 4, 0.01), T('volLocal', 'Lampu lokal membuat berkas', 'spot & point'), R('volLocalIntensity', 'Intensitas lampu', 0, 6, 0.05), C('volAlbedo', 'Warna kabut (albedo)')],
+    },
+    {
+      title: 'Kualitas',
+      items: [R('volSteps', 'Langkah ray-march', 8, 96, 1, undefined, f0), R('volStepExp', 'Distribusi langkah', 1, 3, 0.05, '1 = rata, besar = rapat di dekat'), R('volTemporal', 'Akumulasi temporal', 0, 0.95, 0.01, undefined, pct)],
+    },
+  ],
+  light: [
+    {
+      title: 'Bayangan matahari',
+      open: true,
+      items: [
+        T('pcss', 'PCSS (penumbra dinamis)', 'blocker search'),
+        R('penumbra', 'Ukuran penumbra', 0.002, 0.12, 0.001, undefined, f3),
+        R('shadowDistance', 'Jarak bayangan', 60, 900, 10, 'm', f0),
+        S('cascades', 'Cascade', [1, 2, 3, 4].map((n) => ({ label: String(n), value: String(n) }))),
+        S('shadowSize', 'Resolusi', [1024, 2048, 4096].map((n) => ({ label: String(n), value: String(n) }))),
+        T('localShadows', 'Bayangan lampu lokal (atlas)'),
+        R('microShadow', 'Micro-shadowing', 0, 1, 0.01, undefined, pct),
+        T('contact', 'Contact shadow'),
+      ],
+    },
+    {
+      title: 'Global Illumination',
+      open: true,
+      items: [T('ssgi', 'SSGI + world cache'), R('ssgiIntensity', 'Intensitas', 0, 4, 0.05), R('ssgiRays', 'Sinar', 1, 4, 1, undefined, f0), T('ssgiBounce', 'Multi-bounce (infinite bounce)'), T('ssgiCache', 'Radiance cache dunia (off-screen)')],
+    },
+    {
+      title: 'Oklusi & pantulan',
+      items: [T('ssao', 'GTAO'), R('gtaoIntensity', 'Intensitas AO', 0, 3, 0.05), R('gtaoRadius', 'Radius AO', 0.2, 3, 0.05, 'm'), T('ssr', 'SSR (jalan basah, kaca)'), R('ssrIntensity', 'Intensitas SSR', 0, 2, 0.05), R('ssrSteps', 'Langkah SSR', 16, 160, 1, undefined, f0)],
+    },
+    {
+      title: 'Permukaan & kota',
+      items: [T('pom', 'Parallax occlusion (jendela, curb)'), R('pomQuality', 'Kualitas POM', 0.2, 1, 0.05), T('decals', 'Decal (retak, genangan)'), R('lampIntensity', 'Lampu jalan', 0, 4000, 10, 'cd', f0), R('windowGlow', 'Cahaya jendela', 0, 20, 0.1, undefined, f1)],
+    },
+  ],
+  lens: [
+    {
+      title: 'Kamera fisik',
+      open: true,
+      items: [
+        R('fov', 'Field of view', 20, 110, 1, '°', f0),
+        T('autoExposure', 'Eksposur otomatis (histogram)'),
+        R('exposure', 'Eksposur manual', 0.05, 8, 0.01),
+        R('ev', 'Kompensasi EV', -4, 4, 0.05, 'stop', f1),
+        R('centerWeight', 'Bobot tengah layar', 0, 1, 0.01, undefined, pct),
+        S('tone', 'Tone mapping', (['agx', 'aces', 'neutral', 'filmic', 'reinhard', 'none'] as ToneMapping[]).map((v) => ({ label: v.toUpperCase(), value: v }))),
+      ],
+    },
+    {
+      title: 'Bloom & optik',
+      open: true,
+      items: [T('bloom', 'Bloom'), R('bloomIntensity', 'Intensitas bloom', 0, 1.5, 0.01), T('bloomEnergy', 'Bloom fisik (energi kekal)'), R('halation', 'Halation film', 0, 1, 0.01), R('lensDirt', 'Lensa kotor', 0, 1, 0.01), T('flare', 'Lens flare'), R('flareIntensity', 'Intensitas flare', 0, 1, 0.01), R('vignette', 'Vignette', 0, 1, 0.01), R('opticalVignette', 'Vignette optik (cos⁴)', 0, 1, 0.01), R('chroma', 'Aberasi kromatik', 0, 0.01, 0.0001, undefined, f4), R('grain', 'Grain', 0, 0.4, 0.005, undefined, f3)],
+    },
+    {
+      title: 'Depth of field & gerak',
+      items: [T('dof', 'Depth of field'), R('dofFocus', 'Jarak fokus', 2, 400, 1, 'm', f0), R('dofFStop', 'f-stop', 1, 16, 0.1, undefined, f1), T('mb', 'Motion blur'), R('mbIntensity', 'Intensitas', 0, 1, 0.01), T('taa', 'TAA'), R('sharpen', 'Sharpen', 0, 1, 0.01)],
+    },
+    {
+      title: 'Grading',
+      items: [
+        R('saturation', 'Saturasi', 0, 2, 0.01),
+        R('contrast', 'Kontras', 0.5, 1.6, 0.01),
+        R('temperature', 'Suhu warna', -1, 1, 0.01),
+        S('look', 'Look', Object.keys(LOOKS).map((v) => ({ label: v, value: v }))),
+      ],
+    },
+  ],
 };
 
-const SKY_PRESETS = [
-  { name: 'Siang', e: 52, a: 140 },
-  { name: 'Sore', e: 14, a: 120 },
-  { name: 'Golden hour', e: 4.5, a: 100 },
-  { name: 'Senja', e: -0.8, a: 95 },
-  { name: 'Malam + bulan', e: -32, a: 140 },
-];
+const NUMERIC_SELECT = new Set<keyof Settings>(['cascades', 'shadowSize']);
 
-const KHRONOS = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/';
-const SAMPLES = [
-  { id: 'DamagedHelmet', label: 'Damaged Helmet (PBR lengkap)' },
-  { id: 'BoomBox', label: 'BoomBox' },
-  { id: 'WaterBottle', label: 'Water Bottle' },
-  { id: 'Avocado', label: 'Avocado' },
-  { id: 'Lantern', label: 'Lantern' },
-  { id: 'CesiumMilkTruck', label: 'Cesium Milk Truck (animasi)' },
-  { id: 'BoxAnimated', label: 'Box Animated (animasi)' },
-  { id: 'ToyCar', label: 'Toy Car' },
-];
+function download(blob: Blob, name: string) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
 
 const fmtN = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(Math.round(n)));
 
-const SNIPPET = `import { Renderer, Scene, PerspectiveCamera,
-  GLTFLoader, AnimationMixer, Sky,
-  DirectionalLight, OrbitControls } from './lumina';
-
-const renderer = new Renderer({ canvas, samples: 0 });
-renderer.post.ssgi.enabled = true;         // GI: warna memantul antar-objek
-renderer.post.refraction.bend = 0.4;       // refraksi screen-space (lensa)
-renderer.post.taa.enabled = true;          // anti-aliasing temporal
-renderer.post.ssr.enabled = true;          // pantulan screen-space
-renderer.post.dof.enabled = true;          // depth of field
-renderer.post.ssao.gtao = true;            // GTAO
-lamp.radius = 0.3;                         // lampu bola (m)
-const lod = createLODFromMesh(mesh);      // LOD otomatis
-
-const scene = new Scene();
-scene.sky = new Sky();
-const sun = new DirectionalLight();
-sun.syncWithSky(scene.sky);
-scene.add(sun);
-
-// POM: set tekstur prosedural sudah membawa heightMap
-const brick = new PBRMaterial({ ...createBricks(), parallaxScale: 0.04 });
-const glass = new PBRMaterial({ transmission: 1, ior: 1.52, thickness: 0.7, dispersion: 4 });
-
-const gltf = await new GLTFLoader().load('model.glb');
-scene.add(gltf.scene);
-
-const mixer = new AnimationMixer();
-mixer.clipAction(gltf.animations[0]).play();
-
-(function loop() {
-  mixer.update(dt);
-  renderer.render(scene, camera);
-})();`;
-
-const FEATURES: [string, string][] = [
-  ['UBER · GTAO (ground-truth AO)', 'Ambient occlusion berbasis horizon (Jimenez 2016): per piksel dicari dua sudut horizon di beberapa slice layar, busur terlihat berbobot cosinus diintegralkan secara analitik. Kontak lebih gelap dan bersih, tanpa halo SSAO hemisfer.'],
-  ['UBER · Lampu bola (sphere area light)', 'PointLight / SpotLight punya radius fisik: diffuse dari pusat, specular dari titik terdekat pada bola ke sinar pantul (Karis 2013) + pelebaran lobus & normalisasi energi → highlight lebar-lembut seperti lampu nyata.'],
-  ['UBER · LOD otomatis (quadric-error clustering)', 'simplifyGeometry() / createLODFromMesh(): sederhanakan mesh ke ribuan→ratusan segitiga dengan posisi vertex hasil minimisasi quadric, seam UV & hard-edge dipertahankan. Scene demo turun dari ratusan ribu (dan hingga jutaan instance) segitiga menjadi puluhan ribu.'],
-  ['UBER · Salju, malam, bintang & bulan', 'Lapisan salju material (atas + cekungan relief, normal lunak). Langit malam prosedural: bintang bebas-aliasing, Bima Sakti, bulan; cahaya key otomatis pindah ke bulan setelah matahari terbenam.'],
-  ['UBER · Halation, noda lensa, autofokus', 'Halation film (bloom hangat kemerahan), debu lensa prosedural yang menyala di dekat cahaya terang, dan autofokus DoF yang mengikuti titik tengah layar.'],
-  ['Lumina 4 · GI dunia + multi-bounce', 'Radiance cache voxel 3D yang mengikuti kamera (surface-cache ala Lumen) – ray SSGI yang keluar layar membaca cache, sehingga dinding merah di belakang kamera tetap mewarnai lantai di depan. Frame GI di-feedback sehingga cahaya memantul berkali-kali.'],
-  ['Lumina 4 · PCSS + shadow atlas lampu lokal', 'Blocker search per cascade: bayangan tajam di titik kontak, melunak dengan jarak. Spot & point light (cube 6 layer) punya shadow atlas sendiri, ikut menghasilkan god rays di volumetric fog. POM juga self-shadow ke lampu lokal.'],
-  ['Lumina 4 · Material berlapis, detail map & decal', 'Normal height ⊕ normal map (RNM), detail map mikro, lapisan basah/debu, decal terproyeksi (retak, kotor, genangan, jelaga, lumut, goresan) yang dihitung di dalam shader material, micro-shadowing & horizon occlusion.'],
-  ['Lumina 4 · Kamera fisik', 'Eksposur histogram center-weighted dengan persentil, kompensasi EV, vignette cos⁴, bloom hemat energi. UV RoundedBox kini arc-length.'],
-  ['Screen-Space Global Illumination — SSGI (baru)', 'Pantulan warna tidak langsung antar-objek ala Lumen: ray cosine-weighted di half-res, ray-march depth, akumulasi temporal (reproyeksi velocity + penolakan disocclusion), blur bilateral depth/normal, upsample bilateral × albedo G-buffer'],
-  ['Parallax Occlusion Mapping — POM (baru)', 'Kedalaman 3D nyata pada bata, kayu, beton & marmer: ray-march height field + refinement biner, self-shadow matahari, cavity AO, normal dari height map, mip stabil (textureGrad), fade jarak & kualitas adaptif'],
-  ['Screen-Space Refraction + dispersi (baru)', 'Ray refraksi di-march menembus depth opaque (parallax benar), bend lensa, dispersi kromatik per kanal RGB (KHR_materials_dispersion), anti-alias mip otomatis, tolak kebocoran objek di depan kaca, fallback ke environment di tepi layar'],
-  ['Refraksi & transmisi nyata (baru)', 'Pass transmission: scene di belakang objek di-resolve ke mip-chain, dibelokkan sesuai IOR, diburamkan oleh roughness, diserap Beer–Lambert (kaca, cairan, kaca buram)'],
-  ['Air fotorealistik (baru)', 'Gelombang dispersi air dalam, refraksi, serapan warna berdasarkan kedalaman nyata dari depth buffer, busa tepi, tanpa kebocoran objek di depan air'],
-  ['Material berlapis (baru)', 'Sheen Charlie (beludru), anisotropy GGX (baja sikat), iridescence film tipis, subsurface wrap (lilin/kulit), IOR → F0'],
-  ['Awan prosedural volumetrik-semu (baru)', 'fBm + domain warp dengan self-shadow, silver lining; ikut di-bake ke IBL, tajam di background, menyaring matahari saat mendung'],
-  ['Bayangan kontak, lens flare, AgX, CDL (baru)', 'Ray-march depth ke arah matahari, flare ghost/halo ber-ambang, tone mapper AgX, ASC CDL, distorsi lensa'],
-  ['Optimasi (baru)', 'compile/compileAsync (pre-warm shader), AdaptiveQuality (tangga penghematan yang dapat dibalik), preset kualitas, mergeGeometries, perbaikan kebocoran resource setelah context restore'],
-  ['TAA (baru)', 'Jitter Halton sub-pixel, motion vector per-objek + kamera, reproyeksi history Catmull-Rom, variance clipping, sharpen'],
-  ['SSR (baru)', 'Ray-march screen-space half-res dengan binary refine, G-buffer normal/roughness/F0, menggantikan specular IBL secara akurat'],
-  ['Depth of Field (baru)', 'Lensa tipis (focal length, f-stop, jarak fokus), bokeh Vogel, foreground tidak tercemar blur background'],
-  ['Motion blur (baru)', 'Blur per-piksel mengikuti velocity buffer (objek bergerak + rotasi kamera)'],
-  ['glTF 2.0 / GLB loader (baru)', 'Accessor sparse/interleaved/normalized, PBR + clearcoat/unlit/emissive, lampu & kamera, hierarchy, animasi LINEAR/STEP/CUBICSPLINE'],
-  ['AnimationMixer (baru)', 'Blend banyak clip dengan bobot, fade/crossfade, loop repeat/once/pingpong'],
-  ['LOD, GPU timer, pulih dari context lost (baru)', 'LOD berhisteresis, waktu GPU asli via timer query, renderer membangun ulang diri setelah WebGL context hilang'],
-  ['PBR + IBL + CSM + SSAO', 'GGX Smith, multi-scatter, clear-coat, atmosfer fisik → cubemap IBL, cascaded shadow, SSAO multi-bounce'],
-  ['Pipeline HDR', 'RGBA16F + MSAA, bloom Karis, auto-exposure GPU, ACES / Neutral / Filmic / Reinhard, volumetric fog'],
-  ['Performa', 'Instancing, frustum culling, state cache, UBO, sorting, dirty-flag matrix, resolusi dinamis'],
-];
-
-type Tab = 'render' | 'effects' | 'uber' | 'model' | 'object';
-
-function download(blob: Blob, name: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 2000);
-}
-
 export default function App() {
   const hostRef = useRef<HTMLDivElement>(null);
-  const showRef = useRef<Showcase | null>(null);
-  const importRef = useRef<HTMLInputElement>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const worldRef = useRef<CityWorld | null>(null);
   const [s, setS] = useState<Settings>(loadSettings);
+  const sRef = useRef(s);
+  sRef.current = s;
   const [progress, setProgress] = useState({ p: 0, label: 'Memulai…' });
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [stats, setStats] = useState<Record<string, number | string | boolean>>({});
-  const [panel, setPanel] = useState(true);
-  const [about, setAbout] = useState(false);
-  const [tab, setTab] = useState<Tab>('render');
-  const [picked, setPicked] = useState<PickResult | null>(null);
-  const [pickedFlash, setPickedFlash] = useState<string | null>(null);
-  const [model, setModel] = useState<ModelInfo | null>(null);
-  const [modelBusy, setModelBusy] = useState<{ p: number; label: string } | null>(null);
-  const [modelError, setModelError] = useState<string | null>(null);
-  const [sampleId, setSampleId] = useState(SAMPLES[0].id);
-  const [url, setUrl] = useState('');
-  const [clip, setClip] = useState(0);
-  const [clipSpeed, setClipSpeed] = useState(1);
-  const [dragging, setDragging] = useState(false);
   const [lost, setLost] = useState(false);
+  const [panel, setPanel] = useState(() => new URLSearchParams(window.location.search).get('noui') === null);
+  const [hud, setHud] = useState(true);
+  const [tab, setTab] = useState<Tab>('scene');
+  const [stats, setStats] = useState<Record<string, number | string>>({});
   const [toast, setToast] = useState<string | null>(null);
-  const [, bump] = useReducer((x: number) => x + 1, 0);
-  const downRef = useRef({ x: 0, y: 0, t: 0 });
-  const sRef = useRef(s);
-  sRef.current = s;
 
-  const say = (m: string) => {
+  const say = useCallback((m: string) => {
     setToast(m);
-    setTimeout(() => setToast((c) => (c === m ? null : c)), 2600);
-  };
+    setTimeout(() => setToast((c) => (c === m ? null : c)), 2400);
+  }, []);
+  const set = useCallback(<K extends keyof Settings>(k: K, v: Settings[K]) => setS((p) => ({ ...p, [k]: v })), []);
+  const patch = useCallback((p: Partial<Settings>) => setS((c) => ({ ...c, ...p })), []);
 
+  // world lifecycle
   useEffect(() => {
     const canvas = document.createElement('canvas');
     canvas.className = 'block h-full w-full';
     hostRef.current!.appendChild(canvas);
-    let show: Showcase | null = null;
     let disposed = false;
-    const onResize = () => show?.resize(window.innerWidth, window.innerHeight);
-    createShowcase(canvas, (p, label) => !disposed && setProgress({ p, label }))
-      .then((sh) => {
-        if (disposed) return sh.dispose();
-        show = sh;
-        showRef.current = sh;
-        (window as unknown as { __show: Showcase }).__show = sh;
-        sh.renderer.onContextLost = () => setLost(true);
-        sh.renderer.onContextRestored = () => setLost(false);
+    let world: CityWorld | null = null;
+    const q = new URLSearchParams(window.location.search);
+    const lite = q.get('lite') !== null;
+    const onResize = () => world?.resize(window.innerWidth, window.innerHeight);
+    CityWorld.create(canvas, (p, label) => !disposed && setProgress({ p, label }), lite ? { blocks: 6, roadTexture: 512, facadeTexture: 512 } : {})
+      .then((w) => {
+        if (disposed) return w.dispose();
+        world = w;
+        worldRef.current = w;
+        (window as unknown as { __world: CityWorld }).__world = w;
+        w.renderer.onContextLost = () => setLost(true);
+        w.renderer.onContextRestored = () => setLost(false);
+        w.onModeChange = (m) => setS((c) => (c.mode === m ? c : { ...c, mode: m }));
+        w.apply(sRef.current);
         onResize();
-        sh.start();
+        w.start();
         setReady(true);
       })
-      .catch((e: Error) => !disposed && setError(e.message));
+      .catch((e: Error) => !disposed && setError(e.message || String(e)));
     window.addEventListener('resize', onResize);
     const timer = setInterval(() => {
-      const r = showRef.current?.renderer;
-      if (!r) return;
-      const i = r.info;
+      const w = worldRef.current;
+      if (!w) return;
+      const i = w.renderer.info;
+      const c = w.city.stats;
       setStats({
         fps: i.fps,
         ms: i.frameMs,
-        cpu: i.cpuMs,
         gpu: i.gpuMs,
-        gpuOk: r.gpuTimerSupported,
+        cpu: i.cpuMs,
         calls: i.calls,
         tris: i.triangles,
         vis: i.visible,
         cull: i.culled,
-        sh: i.shadowCalls,
-        prog: i.programs,
         lights: i.lights,
+        prog: i.programs,
         res: `${i.width}×${i.height}`,
-        gpuName: r.capabilities.gpu,
-        authored: showRef.current?.authoredTriangles ?? 0,
-        lodN: showRef.current?.lods.length ?? 0,
+        gpuName: w.renderer.capabilities.gpu,
+        clock: w.tod.clock,
+        elev: w.tod.elevation,
+        authored: c.authoredTriangles,
+        instanced: c.instancedTriangles,
+        buildings: c.buildings,
+        cars: c.cars,
+        lamps: c.lamps,
+        trees: c.trees,
+        meshes: c.instancedMeshes,
+        size: c.size,
       });
+      if (w.tod.timeScale > 0) setS((cur) => (Math.abs(cur.hour - w.tod.hour) > 0.004 ? { ...cur, hour: w.tod.hour } : cur));
     }, 300);
     return () => {
       disposed = true;
       clearInterval(timer);
       window.removeEventListener('resize', onResize);
-      show?.dispose();
-      showRef.current = null;
+      world?.dispose();
+      worldRef.current = null;
       canvas.remove();
     };
   }, []);
 
-  // persist settings
+  // persist + apply
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
     } catch {
-      /* storage may be unavailable (private mode) – settings simply won't persist */
+      /* storage unavailable (private mode) – settings just won't persist */
     }
-  }, [s]);
-
-  // apply settings to the engine
-  useEffect(() => {
-    const sh = showRef.current;
-    if (!sh) return;
-    const r = sh.renderer;
-    const p = r.post;
-    sh.setNight(s.stars, s.moon);
-    sh.setSun(s.elevation, s.azimuth);
-    sh.setClouds(s.clouds, s.cloudDensity, s.cloudScale);
-    sh.cloudDrift = s.cloudDrift;
-    sh.fog.density = s.fog / 1000;
-    p.exposure = s.exposure;
-    p.autoExposure = s.autoExposure;
-    p.toneMapping = s.tone;
-    p.bloom.enabled = s.bloom;
-    p.bloom.intensity = s.bloomIntensity;
-    p.ssao.enabled = s.ssao;
-    p.ssao.gtao = s.gtao;
-    p.ssao.radius = s.gtaoRadius;
-    p.ssao.intensity = s.gtaoIntensity;
-    p.vignette = s.vignette;
-    p.grain = s.grain;
-    p.saturation = s.saturation;
-    p.contrast = s.contrast;
-    p.chromaticAberration = s.chroma;
-    p.temperature = s.temperature;
-    p.sharpen = s.sharpen;
-    p.taa.enabled = s.taa;
-    p.taa.feedback = s.taaFeedback;
-    p.taa.jitter = s.taaJitter;
-    p.ssr.enabled = s.ssr;
-    p.ssr.intensity = s.ssrIntensity;
-    p.ssr.maxDistance = s.ssrDistance;
-    p.ssr.thickness = s.ssrThickness;
-    p.ssr.maxRoughness = s.ssrRough;
-    p.ssr.steps = s.ssrSteps;
-    p.dof.enabled = s.dof;
-    sh.autoFocus = s.autoFocus;
-    if (!s.autoFocus) p.dof.focusDistance = s.dofFocus;
-    p.dof.focalLength = s.dofFocal;
-    p.dof.fStop = s.dofFStop;
-    p.dof.maxBlur = s.dofBlur;
-    p.motionBlur.enabled = s.mb;
-    p.motionBlur.intensity = s.mbIntensity;
-    p.volumetricFog.enabled = s.volFog;
-    p.volumetricFog.density = s.volFogDensity;
-    p.volumetricFog.heightFalloff = s.volFogHeightFalloff;
-    p.volumetricFog.anisotropy = s.volFogAnisotropy;
-    p.volumetricFog.intensity = s.volFogIntensity;
-    p.ssgi.enabled = s.ssgi;
-    p.ssgi.intensity = s.ssgiIntensity;
-    p.ssgi.radius = s.ssgiRadius;
-    p.ssgi.rays = s.ssgiRays;
-    p.ssgi.steps = s.ssgiSteps;
-    p.ssgi.blur = s.ssgiBlur;
-    p.ssgi.debug = s.ssgiDebug;
-    p.refraction.screenSpace = s.refrSS;
-    p.refraction.bend = s.refrBend;
-    p.refraction.steps = s.refrSteps;
-    sh.setDispersion(s.dispersion);
-    r.parallax.enabled = s.pom;
-    r.parallax.quality = s.pomQuality;
-    sh.setParallax(s.pomDepth, s.pomShadow, s.pomAO, s.pomSteps);
-    p.contactShadows.enabled = s.contact;
-    p.contactShadows.length = s.contactLength;
-    p.contactShadows.strength = s.contactStrength;
-    p.lensFlare.enabled = s.flare;
-    p.lensFlare.intensity = s.flareIntensity;
-    p.lensFlare.threshold = s.flareThreshold;
-    p.lensFlare.ghosts = s.flareGhosts;
-    p.lensDistortion = s.lensDistortion;
-    const lk = LOOKS[s.look] ?? null;
-    p.cdl.enabled = !!lk;
-    if (lk) {
-      p.cdl.slope = lk.slope;
-      p.cdl.offset = lk.offset;
-      p.cdl.power = lk.power;
-    }
-    sh.water.waves = s.waterWaves;
-    sh.water.waveScale = s.waterScale;
-    sh.water.waveSpeed = s.waterSpeed;
-    sh.water.attenuationDistance = s.waterClarity;
-    sh.water.attenuationColor.setStyle(s.waterColor);
-    r.shadowsEnabled = s.shadows;
-    sh.sun.shadow.mapSize = s.shadowSize;
-    sh.sun.shadow.cascades = s.cascades;
-    sh.sun.shadow.softness = s.softness;
-    r.setSamples(s.msaa);
-    r.dynamicResolution.enabled = false;
-    r.renderScale = s.scale;
-    sh.animate = s.animate;
-    sh.controls.autoRotate = s.autoRotate;
-    sh.setPropsVisible(s.props);
-    sh.setModelScale(s.modelFit);
-    sh.setModelLights(s.modelLights);
-    // ── Lumina 4 ──
-    p.autoExposureMode = s.histExposure ? 'histogram' : 'average';
-    p.autoExposureCenterWeight = s.exposureCenter;
-    p.exposureCompensation = s.exposureComp;
-    p.opticalVignette = s.opticalVignette;
-    p.bloom.energyConserving = s.energyBloom;
-    p.ssgi.multiBounce = s.ssgiBounce;
-    p.ssgi.worldCache = s.ssgiCache;
-    p.ssgi.worldCacheExtent = s.ssgiCacheExtent;
-    p.ssgi.worldCacheResolution = s.ssgiCacheRes;
-    p.ssgi.worldCacheStrength = s.ssgiCacheStrength;
-    sh.sun.shadow.pcss = s.pcss;
-    sh.sun.shadow.penumbra = s.sunPenumbra;
-    r.microShadowing = s.microShadow;
-    r.localShadows.enabled = s.localShadows;
-    r.localShadows.mapSize = s.localShadowSize;
-    r.localShadows.softness = s.localShadowSoft;
-    sh.spot.castShadow = s.localShadows;
-    sh.neonLight.castShadow = s.localShadows;
-    p.volumetricFog.localLights = s.fogLocal;
-    p.volumetricFog.localIntensity = s.fogLocalIntensity;
-    sh.setSurfaceLayers(s.wetness, s.dust);
-    r.decalsEnabled = s.decals;
-    sh.setDecalsVisible(s.decals);
-    sh.setDetail(s.detail, s.detail > 0 ? s.detailRough : 0, s.detailTiling);
-    sh.setPomBlend(s.pomBlend, s.pomLocalShadow);
-    // ── Lumina Uber ──
-    p.halation = s.halation;
-    p.lensDirt = s.lensDirt;
-    sh.setSnow(s.snow);
-    sh.setLightRadii(s.bulbRadius, s.neonRadius, s.spotRadius);
-    sh.setLodScale(s.lodScale);
+    worldRef.current?.apply(s);
   }, [s, ready]);
 
-  const set = <K extends keyof Settings>(k: K, v: Settings[K]) => setS((o) => ({ ...o, [k]: v }));
-  const patch = (pt: Partial<Settings>) => setS((o) => ({ ...o, ...pt }));
+  // shortcuts: H = hide panel, 1..6 = atmosphere presets
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+      if (e.key === 'h' || e.key === 'H') setPanel((p) => !p);
+      const n = parseInt(e.key, 10);
+      if (n >= 1 && n <= PRESETS.length) {
+        patch(PRESETS[n - 1].patch);
+        say(PRESETS[n - 1].label);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [patch, say]);
 
-  const loadModel = async (src: ModelSource) => {
-    const sh = showRef.current;
-    if (!sh) return;
-    setModelBusy({ p: 0, label: 'Memuat model…' });
-    setModelError(null);
+  const shot = async () => {
+    const w = worldRef.current;
+    if (!w) return;
     try {
-      const info = await sh.loadModel(src, (p) => setModelBusy({ p, label: `Mengunduh ${(p * 100).toFixed(0)}%` }));
-      setModel(info);
-      setClip(0);
-      setPicked(null);
-      set('props', false);
-      setTab('model');
-      say(`Model dimuat: ${info.name}`);
+      download(await w.renderer.screenshot(w.scene, w.camera), `lumina-x-${Date.now()}.png`);
+      say('Screenshot tersimpan');
     } catch (e) {
-      setModelError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setModelBusy(null);
+      say('Screenshot gagal: ' + (e as Error).message);
     }
   };
 
-  const onPointerDown = (e: React.PointerEvent) => {
-    downRef.current = { x: e.clientX, y: e.clientY, t: performance.now() };
-  };
-  const onPointerUp = (e: React.PointerEvent) => {
-    const d = downRef.current;
-    if (e.button !== 0 || Math.hypot(e.clientX - d.x, e.clientY - d.y) > 4 || performance.now() - d.t > 400) return;
-    const sh = showRef.current;
-    if (!sh) return;
-    const r = sh.pickObject((e.clientX / window.innerWidth) * 2 - 1, -(e.clientY / window.innerHeight) * 2 + 1, true);
-    setPicked(r);
-    if (r) {
-      setPickedFlash(r.name);
-      setTimeout(() => setPickedFlash((c) => (c === r.name ? null : c)), 2400);
-      if (sRef.current.dofClick) set('dofFocus', Math.min(300, Math.max(0.3, r.distance)));
-    }
-  };
-
-  const onDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragging(false);
-    if (e.dataTransfer.files.length) void loadModel({ kind: 'files', files: Array.from(e.dataTransfer.files) });
-  };
-
-  const exportSettings = () => download(new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' }), 'lumina-settings.json');
-  const importSettings = async (f: File | undefined) => {
-    if (!f) return;
-    try {
-      setS(sanitize(JSON.parse(await f.text())));
-      say('Pengaturan diimpor');
-    } catch {
-      say('File pengaturan tidak valid');
+  const render = (it: Spec) => {
+    const v = s[it.k];
+    switch (it.kind) {
+      case 'range':
+        return <Slider key={it.k} label={it.label} value={v as number} min={it.min} max={it.max} step={it.step} hint={it.hint} fmt={it.fmt} onChange={(x) => set(it.k, x as never)} />;
+      case 'toggle':
+        return <Toggle key={it.k} label={it.label} hint={it.hint} value={v as boolean} onChange={(x) => set(it.k, x as never)} />;
+      case 'color':
+        return <ColorField key={it.k} label={it.label} value={v as string} onChange={(x) => set(it.k, x as never)} />;
+      case 'select':
+        return (
+          <Select
+            key={it.k}
+            label={it.label}
+            value={String(v)}
+            options={it.options}
+            onChange={(x) => set(it.k, (NUMERIC_SELECT.has(it.k) ? Number(x) : x) as never)}
+          />
+        );
     }
   };
 
   const fps = Number(stats.fps ?? 0);
-  const mat = picked?.material ?? null;
+  const modes: { label: string; value: CameraMode }[] = useMemo(
+    () => [
+      { label: '🎬 Sinematik', value: 'path' },
+      { label: '🕊 Terbang', value: 'fly' },
+      { label: '🌐 Orbit', value: 'orbit' },
+    ],
+    []
+  );
 
   return (
-    <div
-      className="fixed inset-0 overflow-hidden bg-slate-950 font-sans text-slate-200 select-none"
-      onDragOver={(e) => {
-        e.preventDefault();
-        if (!dragging) setDragging(true);
-      }}
-      onDragLeave={(e) => e.currentTarget === e.target && setDragging(false)}
-      onDrop={onDrop}
-    >
-      <div ref={hostRef} className="absolute inset-0" onPointerDown={onPointerDown} onPointerUp={onPointerUp} />
+    <div className="fixed inset-0 overflow-hidden bg-black text-slate-200 select-none">
+      <div ref={hostRef} className="absolute inset-0" />
 
-      {/* header */}
-      <div className="pointer-events-none absolute left-5 top-4 z-10">
-        <div className="flex items-center gap-2.5">
-          <div className="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-sky-400 to-indigo-600 shadow-lg shadow-sky-900/40">
-            <svg viewBox="0 0 24 24" className="h-4 w-4 text-white" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 2 3 7v10l9 5 9-5V7z" />
-              <path d="M12 22V12M3 7l9 5 9-5" />
-            </svg>
-          </div>
-          <div>
-            <div className="text-sm font-semibold tracking-wide text-white drop-shadow">LUMINA UBER</div>
-            <div className="text-[10px] uppercase tracking-[0.2em] text-slate-300/80 drop-shadow">WebGL2 · GTAO · Sphere lights · Auto-LOD · Salju · Malam</div>
-          </div>
-        </div>
-      </div>
-
-      <div className="absolute right-5 top-4 z-10 flex gap-2">
-        <button
-          onClick={() => {
-            const sh = showRef.current;
-            if (!sh) return;
-            sh.screenshot().then((b) => download(b, 'lumina.png'), () => say('Gagal mengambil gambar'));
-          }}
-          className="rounded-lg bg-slate-900/70 px-3 py-1.5 text-xs font-medium text-slate-200 ring-1 ring-white/10 backdrop-blur hover:bg-slate-800/80"
-        >
-          📷 Foto
-        </button>
-        <button onClick={() => setAbout(true)} className="rounded-lg bg-slate-900/70 px-3 py-1.5 text-xs font-medium text-slate-200 ring-1 ring-white/10 backdrop-blur hover:bg-slate-800/80">
-          Tentang library
-        </button>
-        <button onClick={() => setPanel(!panel)} className="rounded-lg bg-slate-900/70 px-3 py-1.5 text-xs font-medium text-slate-200 ring-1 ring-white/10 backdrop-blur hover:bg-slate-800/80">
-          {panel ? 'Sembunyikan panel' : 'Tampilkan panel'}
-        </button>
-      </div>
-
-      {/* stats */}
-      {ready && (
-        <div className="pointer-events-none absolute bottom-4 left-5 z-10 w-56 rounded-xl bg-slate-950/70 p-3 text-[11px] leading-5 ring-1 ring-white/10 backdrop-blur">
-          <div className="mb-1 flex items-baseline justify-between">
-            <span className={`text-2xl font-semibold tabular-nums ${fps >= 55 ? 'text-emerald-400' : fps >= 30 ? 'text-amber-300' : 'text-rose-400'}`}>{fps.toFixed(0)}</span>
-            <span className="text-slate-500">FPS · {Number(stats.ms ?? 0).toFixed(1)} ms</span>
-          </div>
-          <Stat k="CPU render" v={`${Number(stats.cpu ?? 0).toFixed(2)} ms`} />
-          <Stat k="GPU render" v={stats.gpuOk ? `${Number(stats.gpu ?? 0).toFixed(2)} ms` : 'n/a'} />
-          <Stat k="Draw calls" v={String(stats.calls ?? 0)} />
-          <Stat k="Segitiga" v={fmtN(Number(stats.tris ?? 0))} />
-          <Stat k="Terlihat / di-cull" v={`${stats.vis ?? 0} / ${stats.cull ?? 0}`} />
-          <Stat k="Shadow draws" v={String(stats.sh ?? 0)} />
-          <Stat k="Lampu · program" v={`${stats.lights ?? 0} · ${stats.prog ?? 0}`} />
-          <Stat k="Resolusi internal" v={String(stats.res ?? '')} />
-          <div className="mt-1 truncate text-[10px] text-slate-500" title={String(stats.gpuName ?? '')}>
-            {String(stats.gpuName ?? '')}
-          </div>
-        </div>
-      )}
-
-      {pickedFlash && (
-        <div className="pointer-events-none absolute bottom-6 left-1/2 z-10 -translate-x-1/2 rounded-full bg-slate-950/80 px-4 py-2 text-xs text-slate-100 ring-1 ring-sky-400/40 backdrop-blur">◎ {pickedFlash}</div>
-      )}
-      {ready && !pickedFlash && (
-        <div className="pointer-events-none absolute bottom-5 left-1/2 z-10 hidden -translate-x-1/2 text-[11px] text-white/70 drop-shadow xl:block">
-          Drag: putar · Klik kanan / Shift+drag: geser · Scroll: zoom · Klik objek: fokus &amp; edit material · Seret file .glb ke sini
-        </div>
-      )}
-      {toast && <div className="pointer-events-none absolute left-1/2 top-16 z-30 -translate-x-1/2 rounded-full bg-emerald-500/90 px-4 py-1.5 text-xs font-medium text-white shadow-lg">{toast}</div>}
-
-      {/* control panel */}
-      {panel && ready && (
-        <div className="absolute bottom-4 right-5 top-16 z-10 w-80 overflow-y-auto rounded-2xl bg-slate-950/80 ring-1 ring-white/10 backdrop-blur-md [scrollbar-width:thin]">
-          <Tabs
-            value={tab}
-            onChange={setTab}
-            tabs={[
-              { id: 'render', label: 'Render' },
-              { id: 'effects', label: 'Efek' },
-              { id: 'uber', label: 'Uber' },
-              { id: 'model', label: 'Model' },
-              { id: 'object', label: 'Objek' },
-            ]}
-          />
-
-          {tab === 'render' && (
-            <>
-              <Section title="Preset kualitas">
-                <div className="grid grid-cols-5 gap-1.5">
-                  {QUALITY.map((q) => (
-                    <button key={q.name} onClick={() => patch(q.patch)} className="rounded-md bg-white/5 py-1.5 text-[11px] font-medium text-slate-300 hover:bg-sky-500/30 hover:text-white">
-                      {q.name}
-                    </button>
-                  ))}
-                </div>
-                <div className="grid grid-cols-3 gap-1.5">
-                  <Button onClick={exportSettings}>Ekspor</Button>
-                  <Button onClick={() => importRef.current?.click()}>Impor</Button>
-                  <Button variant="danger" onClick={() => setS(DEFAULTS)}>
-                    Reset
-                  </Button>
-                </div>
-                <input ref={importRef} type="file" accept="application/json" hidden onChange={(e) => void importSettings(e.target.files?.[0]).then(() => (e.target.value = ''))} />
-                <div className="text-[10px] text-slate-500">Pengaturan tersimpan otomatis di browser.</div>
-              </Section>
-
-              <Section title="Langit & waktu">
-                <div className="grid grid-cols-3 gap-1.5">
-                  {SKY_PRESETS.map((p) => (
-                    <button key={p.name} onClick={() => patch({ elevation: p.e, azimuth: p.a })} className="rounded-md bg-white/5 py-1.5 text-[11px] font-medium text-slate-300 hover:bg-sky-500/30 hover:text-white">
-                      {p.name}
-                    </button>
-                  ))}
-                </div>
-                <Slider label="Elevasi matahari" value={s.elevation} min={-45} max={85} step={0.1} onChange={(v) => set('elevation', v)} fmt={(v) => v.toFixed(1) + '°'} />
-                <Slider label="Azimuth" value={s.azimuth} min={0} max={360} step={1} onChange={(v) => set('azimuth', v)} fmt={(v) => v.toFixed(0) + '°'} />
-                <Slider label="Kabut atmosfer" value={s.fog} min={0} max={8} step={0.05} onChange={(v) => set('fog', v)} />
-              </Section>
-
-              <Section title="Pencahayaan & bayangan">
-                <Toggle label="Cascaded shadow maps" value={s.shadows} onChange={(v) => set('shadows', v)} />
-                <Segmented label="Resolusi shadow" value={s.shadowSize} options={[{ label: '1K', value: 1024 }, { label: '2K', value: 2048 }, { label: '4K', value: 4096 }]} onChange={(v) => set('shadowSize', v)} />
-                <Segmented label="Jumlah cascade" value={s.cascades} options={[1, 2, 3, 4].map((n) => ({ label: String(n), value: n }))} onChange={(v) => set('cascades', v)} />
-                <Slider label="Kelembutan penumbra" value={s.softness} min={0.5} max={4} step={0.05} onChange={(v) => set('softness', v)} />
-                <Toggle label="Ambient occlusion" hint="GTAO / SSAO" value={s.ssao} onChange={(v) => set('ssao', v)} />
-                {s.ssao && (
-                  <>
-                    <Toggle label="GTAO (horizon-based)" hint="lebih akurat dari SSAO hemisfer" value={s.gtao} onChange={(v) => set('gtao', v)} />
-                    <Slider label="Radius AO" value={s.gtaoRadius} min={0.2} max={2.5} step={0.05} onChange={(v) => set('gtaoRadius', v)} fmt={(v) => v.toFixed(2) + ' m'} />
-                    <Slider label="Kekuatan AO" value={s.gtaoIntensity} min={0} max={2} step={0.05} onChange={(v) => set('gtaoIntensity', v)} />
-                  </>
-                )}
-                <Toggle label="Volumetric fog" hint="butuh shadow aktif" value={s.volFog} onChange={(v) => set('volFog', v)} />
-                {s.volFog && (
-                  <>
-                    <Slider label="Kepadatan" value={s.volFogDensity} min={0} max={0.15} step={0.001} onChange={(v) => set('volFogDensity', v)} />
-                    <Slider label="Peluruhan ketinggian" value={s.volFogHeightFalloff} min={0} max={0.3} step={0.005} onChange={(v) => set('volFogHeightFalloff', v)} />
-                    <Slider label="Arah hamburan" hint="negatif = ke kamera" value={s.volFogAnisotropy} min={-0.9} max={0.9} step={0.01} onChange={(v) => set('volFogAnisotropy', v)} />
-                    <Slider label="Intensitas sinar" value={s.volFogIntensity} min={0} max={4} step={0.05} onChange={(v) => set('volFogIntensity', v)} />
-                  </>
-                )}
-              </Section>
-
-              <Section title="Awan prosedural">
-                <Slider label="Tutupan awan" hint="0 = cerah, 1 = mendung" value={s.clouds} min={0} max={1} step={0.01} onChange={(v) => set('clouds', v)} fmt={(v) => (v * 100).toFixed(0) + '%'} />
-                {s.clouds > 0 && (
-                  <>
-                    <Slider label="Kepadatan" value={s.cloudDensity} min={0.3} max={2.5} step={0.05} onChange={(v) => set('cloudDensity', v)} />
-                    <Slider label="Skala awan" hint="besar ↔ kecil" value={s.cloudScale} min={0.8} max={5} step={0.05} onChange={(v) => set('cloudScale', v)} />
-                    <Toggle label="Awan bergerak (angin)" value={s.cloudDrift} onChange={(v) => set('cloudDrift', v)} />
-                  </>
-                )}
-                <div className="text-[10px] text-slate-500">Awan ikut mewarnai pencahayaan &amp; pantulan, dan menyaring sinar matahari saat mendung.</div>
-              </Section>
-
-              <Section title="Air kolam (refraksi)">
-                <Slider label="Tinggi gelombang" value={s.waterWaves} min={0} max={0.12} step={0.002} onChange={(v) => set('waterWaves', v)} />
-                <Slider label="Skala riak" value={s.waterScale} min={0.4} max={3} step={0.05} onChange={(v) => set('waterScale', v)} />
-                <Slider label="Kecepatan" value={s.waterSpeed} min={0} max={3} step={0.05} onChange={(v) => set('waterSpeed', v)} fmt={(v) => '×' + v.toFixed(2)} />
-                <Slider label="Kejernihan" hint="jarak serap warna" value={s.waterClarity} min={0.3} max={12} step={0.1} onChange={(v) => set('waterClarity', v)} fmt={(v) => v.toFixed(1) + ' m'} />
-                <ColorField label="Warna air" value={s.waterColor} onChange={(h) => set('waterColor', h)} />
-              </Section>
-
-              <Section title="Kamera & tone mapping">
-                <Toggle label="Auto exposure" hint="adaptasi mata" value={s.autoExposure} onChange={(v) => set('autoExposure', v)} />
-                <Slider label="Kompensasi exposure" value={s.exposure} min={0.25} max={3} step={0.01} onChange={(v) => set('exposure', v)} fmt={(v) => '×' + v.toFixed(2)} />
-                <Segmented
-                  label="Tone mapper"
-                  value={s.tone}
-                  options={[{ label: 'AgX', value: 'agx' }, { label: 'ACES', value: 'aces' }, { label: 'Neutral', value: 'neutral' }, { label: 'Filmic', value: 'filmic' }, { label: 'Reinhard', value: 'reinhard' }, { label: 'Linear', value: 'none' }]}
-                  onChange={(v) => set('tone', v as ToneMapping)}
-                />
-                <Toggle label="Bloom" value={s.bloom} onChange={(v) => set('bloom', v)} />
-                <Slider label="Intensitas bloom" value={s.bloomIntensity} min={0} max={0.6} step={0.005} onChange={(v) => set('bloomIntensity', v)} />
-                <div>
-                  <div className="mb-1 text-xs text-slate-400">Posisi kamera</div>
-                  <div className="grid grid-cols-4 gap-1">
-                    {(['default', 'top', 'front', 'low', 'close', 'relief', 'glass', 'gi'] as const).map((p) => (
-                      <Button key={p} onClick={() => showRef.current?.setCameraPreset(p)}>
-                        {{ default: 'Awal', top: 'Atas', front: 'Depan', low: 'Rendah', close: 'Dekat', relief: 'Relief', glass: 'Kaca', gi: 'GI' }[p]}
-                      </Button>
-                    ))}
-                  </div>
-                </div>
-              </Section>
-
-              <Section title="Performa">
-                <Segmented label="MSAA" value={s.msaa} options={[{ label: 'Off', value: 0 }, { label: '2×', value: 2 }, { label: '4×', value: 4 }]} onChange={(v) => set('msaa', v)} />
-                <Slider label="Render scale" hint="supersampling bila > 100%" value={s.scale} min={0.4} max={1.5} step={0.05} onChange={(v) => set('scale', v)} fmt={(v) => (v * 100).toFixed(0) + '%'} />
-                <Note>Resolusi, MSAA dan efek tidak diturunkan otomatis — semua pengaturan persis seperti yang kamu pilih.</Note>
-              </Section>
-
-              <Section title="Scene" defaultOpen={false}>
-                <Toggle label="Animasi" value={s.animate} onChange={(v) => set('animate', v)} />
-                <Toggle label="Auto-rotate kamera" value={s.autoRotate} onChange={(v) => set('autoRotate', v)} />
-                <Toggle label="Tampilkan objek demo" value={s.props} onChange={(v) => set('props', v)} />
-              </Section>
-            </>
-          )}
-
-          {tab === 'effects' && (
-            <>
-              <Section title="Global illumination (SSGI)">
-                <Toggle label="Aktifkan SSGI" hint="warna memantul antar-objek" value={s.ssgi} onChange={(v) => set('ssgi', v)} />
-                {s.ssgi && (
-                  <>
-                    <Slider label="Intensitas bounce" value={s.ssgiIntensity} min={0} max={4} step={0.05} onChange={(v) => set('ssgiIntensity', v)} />
-                    <Slider label="Radius bounce" value={s.ssgiRadius} min={1} max={20} step={0.5} onChange={(v) => set('ssgiRadius', v)} fmt={(v) => v.toFixed(1) + ' m'} />
-                    <Segmented label="Ray per piksel" value={s.ssgiRays} options={[1, 2, 3, 4].map((n) => ({ label: String(n), value: n }))} onChange={(v) => set('ssgiRays', v)} />
-                    <Segmented label="Langkah ray" value={s.ssgiSteps} options={[{ label: '8', value: 8 }, { label: '16', value: 16 }, { label: '24', value: 24 }, { label: '32', value: 32 }]} onChange={(v) => set('ssgiSteps', v)} />
-                    <Slider label="Denoise spasial" value={s.ssgiBlur} min={0} max={8} step={1} onChange={(v) => set('ssgiBlur', v)} fmt={(v) => v.toFixed(0) + ' px'} />
-                    <Toggle label="Tampilkan bounce saja" hint="debug" value={s.ssgiDebug} onChange={(v) => set('ssgiDebug', v)} />
-                  </>
-                )}
-                <Button onClick={() => showRef.current?.setCameraPreset('gi')}>Lihat dinding merah / biru →</Button>
-              </Section>
-
-              <Section title="Refraksi & dispersi">
-                <Toggle label="Refraksi screen-space" hint="ray-march depth" value={s.refrSS} onChange={(v) => set('refrSS', v)} />
-                {s.refrSS && (
-                  <>
-                    <Slider label="Pembengkokan lensa" hint="slab ↔ lensa penuh" value={s.refrBend} min={0} max={1} step={0.01} onChange={(v) => set('refrBend', v)} />
-                    <Segmented label="Langkah ray" value={s.refrSteps} options={[{ label: '12', value: 12 }, { label: '24', value: 24 }, { label: '40', value: 40 }, { label: '64', value: 64 }]} onChange={(v) => set('refrSteps', v)} />
-                  </>
-                )}
-                <Slider label="Dispersi kromatik" hint="pelangi di tepi kaca" value={s.dispersion} min={0} max={4} step={0.05} onChange={(v) => set('dispersion', v)} fmt={(v) => '×' + v.toFixed(2)} />
-                <Button onClick={() => showRef.current?.setCameraPreset('glass')}>Lihat lensa &amp; prisma →</Button>
-              </Section>
-
-              <Section title="Parallax occlusion mapping">
-                <Toggle label="Aktifkan POM" hint="kedalaman nyata" value={s.pom} onChange={(v) => set('pom', v)} />
-                {s.pom && (
-                  <>
-                    <Slider label="Kedalaman relief" hint="× dasar material" value={s.pomDepth} min={0} max={3} step={0.05} onChange={(v) => set('pomDepth', v)} fmt={(v) => '×' + v.toFixed(2)} />
-                    <Slider label="Kualitas ray-march" value={s.pomQuality} min={0.25} max={1} step={0.05} onChange={(v) => set('pomQuality', v)} fmt={(v) => (v * 100).toFixed(0) + '%'} />
-                    <Segmented label="Langkah maksimum" value={s.pomSteps} options={[{ label: '16', value: 16 }, { label: '32', value: 32 }, { label: '40', value: 40 }, { label: '64', value: 64 }]} onChange={(v) => set('pomSteps', v)} />
-                    <Slider label="Self-shadow relief" value={s.pomShadow} min={0} max={1} step={0.01} onChange={(v) => set('pomShadow', v)} />
-                    <Slider label="Cavity occlusion" value={s.pomAO} min={0} max={1} step={0.01} onChange={(v) => set('pomAO', v)} />
-                  </>
-                )}
-                <Button onClick={() => showRef.current?.setCameraPreset('relief')}>Lihat panel relief →</Button>
-              </Section>
-
-              <Section title="Temporal AA (TAA)">
-                <Toggle label="Aktifkan TAA" hint="matikan MSAA untuk performa" value={s.taa} onChange={(v) => set('taa', v)} />
-                {s.taa && (
-                  <>
-                    <Slider label="Bobot history" hint="tinggi = halus, ghosting" value={s.taaFeedback} min={0.7} max={0.97} step={0.01} onChange={(v) => set('taaFeedback', v)} />
-                    <Slider label="Jitter" value={s.taaJitter} min={0} max={1.5} step={0.05} onChange={(v) => set('taaJitter', v)} />
-                  </>
-                )}
-                <Slider label="Sharpen" hint="imbangi blur TAA" value={s.sharpen} min={0} max={1} step={0.01} onChange={(v) => set('sharpen', v)} />
-              </Section>
-
-              <Section title="Screen-space reflections">
-                <Toggle label="Aktifkan SSR" value={s.ssr} onChange={(v) => set('ssr', v)} />
-                {s.ssr && (
-                  <>
-                    <Slider label="Intensitas" value={s.ssrIntensity} min={0} max={1.5} step={0.01} onChange={(v) => set('ssrIntensity', v)} />
-                    <Slider label="Jarak maksimum" value={s.ssrDistance} min={5} max={120} step={1} onChange={(v) => set('ssrDistance', v)} fmt={(v) => v.toFixed(0) + ' m'} />
-                    <Slider label="Ketebalan" value={s.ssrThickness} min={0.05} max={3} step={0.05} onChange={(v) => set('ssrThickness', v)} fmt={(v) => v.toFixed(2) + ' m'} />
-                    <Slider label="Roughness maksimum" value={s.ssrRough} min={0.1} max={1} step={0.01} onChange={(v) => set('ssrRough', v)} />
-                    <Segmented label="Langkah ray" value={s.ssrSteps} options={[{ label: '32', value: 32 }, { label: '64', value: 64 }, { label: '96', value: 96 }, { label: '128', value: 128 }]} onChange={(v) => set('ssrSteps', v)} />
-                  </>
-                )}
-              </Section>
-
-              <Section title="Depth of field">
-                <Toggle label="Aktifkan DoF" value={s.dof} onChange={(v) => set('dof', v)} />
-                {s.dof && (
-                  <>
-                    <Toggle label="Klik objek = fokus" value={s.dofClick} onChange={(v) => set('dofClick', v)} />
-                    <Slider label="Jarak fokus" value={s.dofFocus} min={0.5} max={120} step={0.1} onChange={(v) => set('dofFocus', v)} fmt={(v) => v.toFixed(1) + ' m'} />
-                    <Slider label="Focal length" value={s.dofFocal} min={18} max={200} step={1} onChange={(v) => set('dofFocal', v)} fmt={(v) => v.toFixed(0) + ' mm'} />
-                    <Slider label="Aperture" value={s.dofFStop} min={0.95} max={16} step={0.05} onChange={(v) => set('dofFStop', v)} fmt={(v) => 'f/' + v.toFixed(2)} />
-                    <Slider label="Blur maksimum" value={s.dofBlur} min={2} max={32} step={1} onChange={(v) => set('dofBlur', v)} fmt={(v) => v.toFixed(0) + ' px'} />
-                  </>
-                )}
-              </Section>
-
-              <Section title="Motion blur">
-                <Toggle label="Aktifkan motion blur" hint="objek & kamera" value={s.mb} onChange={(v) => set('mb', v)} />
-                {s.mb && <Slider label="Intensitas shutter" value={s.mbIntensity} min={0.1} max={2} step={0.05} onChange={(v) => set('mbIntensity', v)} />}
-              </Section>
-
-              <Section title="Bayangan kontak (screen-space)">
-                <Toggle label="Aktifkan" hint="mendasari objek kecil" value={s.contact} onChange={(v) => set('contact', v)} />
-                {s.contact && (
-                  <>
-                    <Slider label="Panjang ray" value={s.contactLength} min={0.1} max={2} step={0.05} onChange={(v) => set('contactLength', v)} fmt={(v) => v.toFixed(2) + ' m'} />
-                    <Slider label="Kekuatan" value={s.contactStrength} min={0} max={1} step={0.01} onChange={(v) => set('contactStrength', v)} />
-                  </>
-                )}
-              </Section>
-
-              <Section title="Lensa & flare">
-                <Toggle label="Lens flare" hint="hanya sumber cahaya terang" value={s.flare} onChange={(v) => set('flare', v)} />
-                {s.flare && (
-                  <>
-                    <Slider label="Intensitas" value={s.flareIntensity} min={0} max={1.5} step={0.01} onChange={(v) => set('flareIntensity', v)} />
-                    <Slider label="Ambang kecerahan" value={s.flareThreshold} min={1} max={60} step={0.5} onChange={(v) => set('flareThreshold', v)} />
-                    <Segmented label="Jumlah ghost" value={s.flareGhosts} options={[{ label: '2', value: 2 }, { label: '4', value: 4 }, { label: '5', value: 5 }, { label: '8', value: 8 }]} onChange={(v) => set('flareGhosts', v)} />
-                  </>
-                )}
-                <Slider label="Distorsi lensa" hint="barrel ↔ pincushion" value={s.lensDistortion} min={-0.1} max={0.1} step={0.002} onChange={(v) => set('lensDistortion', v)} />
-              </Section>
-
-              <Section title="Look sinematik (CDL)">
-                <Segmented
-                  label="Gradasi warna"
-                  value={s.look}
-                  options={[{ label: 'Netral', value: 'none' }, { label: 'Hangat', value: 'warm' }, { label: 'Teal', value: 'teal' }, { label: 'Dingin', value: 'cool' }, { label: 'Pudar', value: 'fade' }]}
-                  onChange={(v) => set('look', v)}
-                />
-              </Section>
-
-              <Section title="Color grading" defaultOpen={false}>
-                <Slider label="Suhu warna" hint="dingin ↔ hangat" value={s.temperature} min={-1} max={1} step={0.01} onChange={(v) => set('temperature', v)} />
-                <Slider label="Saturasi" value={s.saturation} min={0} max={2} onChange={(v) => set('saturation', v)} />
-                <Slider label="Kontras" value={s.contrast} min={0.7} max={1.5} onChange={(v) => set('contrast', v)} />
-                <Slider label="Vignette" value={s.vignette} min={0} max={1} onChange={(v) => set('vignette', v)} />
-                <Slider label="Film grain" value={s.grain} min={0} max={0.5} onChange={(v) => set('grain', v)} />
-                <Slider label="Chromatic aberration" value={s.chroma} min={0} max={0.01} step={0.0002} onChange={(v) => set('chroma', v)} fmt={(v) => (v * 1000).toFixed(1)} />
-              </Section>
-            </>
-          )}
-
-          {tab === 'uber' && (
-            <>
-              <Section title="Uber · Geometri hemat & LOD otomatis">
-                <div className="space-y-0.5 text-[11px]">
-                  <Stat k="Segitiga di-author (detail penuh)" v={fmtN(Number(stats.authored ?? 0))} />
-                  <Stat k="Segitiga dikirim ke GPU sekarang" v={fmtN(Number(stats.tris ?? 0))} />
-                  <Stat k="Grup LOD otomatis" v={String(stats.lodN ?? 0)} />
-                </div>
-                <Slider label="Jarak pindah LOD" hint="> 1 = detail bertahan lebih jauh" value={s.lodScale} min={0.2} max={3} step={0.05} onChange={(v) => set('lodScale', v)} fmt={(v) => '×' + v.toFixed(2)} />
-                <Note>Tidak ada ribuan box lagi: scene hanya beberapa model mulus. Detail permukaan berasal dari material (relief parallax, detail map, decal) dan level LOD dibuat otomatis oleh <code>createLODFromMesh()</code> (quadric-error clustering).</Note>
-              </Section>
-
-              <Section title="Uber · Lampu bola (area light)">
-                <Slider label="Bohlam biru" hint="radius sumber cahaya" value={s.bulbRadius} min={0} max={1.2} step={0.01} onChange={(v) => set('bulbRadius', v)} fmt={(v) => (v * 100).toFixed(0) + ' cm'} />
-                <Slider label="Lampu neon" value={s.neonRadius} min={0} max={1.5} step={0.01} onChange={(v) => set('neonRadius', v)} fmt={(v) => (v * 100).toFixed(0) + ' cm'} />
-                <Slider label="Lampu sorot" value={s.spotRadius} min={0} max={1} step={0.01} onChange={(v) => set('spotRadius', v)} fmt={(v) => (v * 100).toFixed(0) + ' cm'} />
-                <Note>Radius &gt; 0 memberi highlight lebar &amp; lembut seperti lampu nyata pada bola emas / plastik (representative-point, energi ternormalisasi). 0 = titik ideal.</Note>
-                <Button onClick={() => showRef.current?.setCameraPreset('default')}>Lihat bola material →</Button>
-              </Section>
-
-              <Section title="Uber · Cuaca & malam">
-                <Slider label="Salju" hint="menumpuk di permukaan atas & cekungan" value={s.snow} min={0} max={1} step={0.01} onChange={(v) => set('snow', v)} fmt={(v) => (v * 100).toFixed(0) + '%'} />
-                <Slider label="Basah (wetness)" value={s.wetness} min={0} max={1} onChange={(v) => set('wetness', v)} />
-                <Slider label="Debu (dust)" value={s.dust} min={0} max={1} onChange={(v) => set('dust', v)} />
-                <Slider label="Bintang & Bima Sakti" value={s.stars} min={0} max={3} step={0.05} onChange={(v) => set('stars', v)} />
-                <Slider label="Cahaya bulan" value={s.moon} min={0} max={3} step={0.05} onChange={(v) => set('moon', v)} />
-                <div className="grid grid-cols-3 gap-1.5">
-                  <Button onClick={() => patch({ elevation: -32, azimuth: 140 })}>Malam</Button>
-                  <Button onClick={() => patch({ elevation: 38, azimuth: 140, snow: 0.85, wetness: 0, dust: 0, clouds: 0.5 })}>Musim salju</Button>
-                  <Button onClick={() => patch({ snow: 0, wetness: 0.6, dust: 0, clouds: 0.85, elevation: 22 })}>Hujan</Button>
-                </div>
-                <Note>Turunkan elevasi matahari di bawah 0° (tab Render) untuk melihat bintang, bulan, dan lampu-lampu lokal menyala sendirian.</Note>
-              </Section>
-
-              <Section title="Uber · Kamera & lensa">
-                <Toggle label="Autofokus (DoF)" hint="fokus mengikuti titik tengah layar" value={s.autoFocus} onChange={(v) => { set('autoFocus', v); if (v && !s.dof) set('dof', true); }} />
-                <Slider label="Halation film" hint="highlight meluap hangat kemerahan" value={s.halation} min={0} max={1.5} step={0.01} onChange={(v) => set('halation', v)} />
-                <Slider label="Debu / noda lensa" hint="menyala di sekitar cahaya terang" value={s.lensDirt} min={0} max={1.5} step={0.01} onChange={(v) => set('lensDirt', v)} />
-                {s.autoFocus && !s.dof && <Note>Autofokus butuh Depth of Field (tab Efek).</Note>}
-              </Section>
-
-              <Section title="GI dunia (surface cache) & multi-bounce">
-                <Toggle label="Multi-bounce SSGI" hint="frame GI diumpan balik → cahaya memantul berkali-kali" value={s.ssgiBounce} onChange={(v) => set('ssgiBounce', v)} />
-                <Toggle label="World-space radiance cache" hint="voxel 3D mengikuti kamera; ray off-screen membaca cache" value={s.ssgiCache} onChange={(v) => set('ssgiCache', v)} />
-                {s.ssgiCache && (
-                  <>
-                    <Slider label="Jangkauan cache" value={s.ssgiCacheExtent} min={12} max={120} step={1} onChange={(v) => set('ssgiCacheExtent', v)} fmt={(v) => v.toFixed(0) + ' m'} />
-                    <Segmented label="Resolusi voxel" value={s.ssgiCacheRes} options={[16, 24, 32, 48].map((n) => ({ label: n + '³', value: n }))} onChange={(v) => set('ssgiCacheRes', v)} />
-                    <Slider label="Kekuatan GI off-screen" value={s.ssgiCacheStrength} min={0} max={2} onChange={(v) => set('ssgiCacheStrength', v)} />
-                  </>
-                )}
-                {!s.ssgi && <Note>Aktifkan SSGI di tab Efek agar bagian ini berpengaruh.</Note>}
-              </Section>
-
-              <Section title="Bayangan: PCSS & lampu lokal">
-                <Toggle label="PCSS (penumbra dinamis)" hint="blocker search: tajam di kontak, lembut di jauh" value={s.pcss} onChange={(v) => set('pcss', v)} />
-                {s.pcss && <Slider label="Ukuran sumber cahaya" value={s.sunPenumbra} min={0.002} max={0.08} step={0.001} onChange={(v) => set('sunPenumbra', v)} fmt={(v) => v.toFixed(3)} />}
-                <Slider label="Micro-shadowing" hint="rongga material menggelapkan cahaya miring" value={s.microShadow} min={0} max={1} onChange={(v) => set('microShadow', v)} />
-                <Toggle label="Bayangan spot / point light" hint="shadow atlas 8 layer (point = 6 layer)" value={s.localShadows} onChange={(v) => set('localShadows', v)} />
-                {s.localShadows && (
-                  <>
-                    <Segmented label="Resolusi atlas" value={s.localShadowSize} options={[512, 1024, 2048].map((n) => ({ label: String(n), value: n }))} onChange={(v) => set('localShadowSize', v)} />
-                    <Slider label="Kelembutan" value={s.localShadowSoft} min={0.5} max={6} onChange={(v) => set('localShadowSoft', v)} fmt={(v) => v.toFixed(1) + ' texel'} />
-                  </>
-                )}
-                <Toggle label="God rays dari lampu lokal" hint="butuh Volumetric fog (tab Render)" value={s.fogLocal} onChange={(v) => set('fogLocal', v)} />
-                {s.fogLocal && <Slider label="Intensitas cahaya fog lokal" value={s.fogLocalIntensity} min={0} max={4} onChange={(v) => set('fogLocalIntensity', v)} />}
-                {!s.volFog && <Note>Nyalakan "Volumetric fog" untuk melihat berkas cahaya lampu sorot & neon.</Note>}
-              </Section>
-
-              <Section title="Kamera fisik & eye adaptation">
-                <Toggle label="Eksposur histogram" hint="64 bin EV + persentil, center-weighted" value={s.histExposure} onChange={(v) => set('histExposure', v)} />
-                <Slider label="Bobot tengah (metering)" value={s.exposureCenter} min={0} max={1} onChange={(v) => set('exposureCenter', v)} />
-                <Slider label="Kompensasi eksposur" value={s.exposureComp} min={-3} max={3} step={0.1} onChange={(v) => set('exposureComp', v)} fmt={(v) => (v >= 0 ? '+' : '') + v.toFixed(1) + ' EV'} />
-                <Slider label="Vignette optik (cos⁴)" value={s.opticalVignette} min={0} max={1} onChange={(v) => set('opticalVignette', v)} />
-                <Toggle label="Bloom hemat energi" hint="menyebar, bukan menambah cahaya" value={s.energyBloom} onChange={(v) => set('energyBloom', v)} />
-              </Section>
-
-              <Section title="Material berlapis, detail & decal">
-                <Slider label="Basah (wetness)" hint="gelap + licin, mengisi cekungan dulu" value={s.wetness} min={0} max={1} onChange={(v) => set('wetness', v)} />
-                <Slider label="Debu (dust)" hint="mengendap di permukaan atas" value={s.dust} min={0} max={1} onChange={(v) => set('dust', v)} />
-                <Slider label="Detail map: normal" value={s.detail} min={0} max={1.5} onChange={(v) => set('detail', v)} />
-                <Slider label="Detail map: roughness" hint="sidik jari / goresan mikro" value={s.detailRough} min={0} max={0.8} onChange={(v) => set('detailRough', v)} />
-                <Slider label="Tiling detail" value={s.detailTiling} min={2} max={60} step={1} onChange={(v) => set('detailTiling', v)} fmt={(v) => v.toFixed(0) + '×'} />
-                <Toggle label="Decal (retak, kotor, genangan, lumut)" value={s.decals} onChange={(v) => set('decals', v)} />
-                <Slider label="Normal height ⊕ normal map" hint="RNM; 0 = hanya normal map" value={s.pomBlend} min={0} max={1} onChange={(v) => set('pomBlend', v)} />
-                <Toggle label="Self-shadow POM untuk lampu lokal" value={s.pomLocalShadow} onChange={(v) => set('pomLocalShadow', v)} />
-                <div className="grid grid-cols-3 gap-1.5">
-                  <Button onClick={() => showRef.current?.setCameraPreset('decals')}>Dinding</Button>
-                  <Button onClick={() => showRef.current?.setCameraPreset('wet')}>Genangan</Button>
-                  <Button onClick={() => showRef.current?.setCameraPreset('gi')}>GI</Button>
-                </div>
-              </Section>
-            </>
-          )}
-
-          {tab === 'model' && (
-            <>
-              <Section title="Muat model glTF / GLB">
-                <Button variant="primary" onClick={() => void loadModel({ kind: 'sample' })} disabled={!!modelBusy}>
-                  Muat contoh bawaan (offline)
-                </Button>
-                <Select label="Contoh Khronos (butuh internet)" value={sampleId} options={SAMPLES.map((x) => ({ label: x.label, value: x.id }))} onChange={setSampleId} />
-                <Button
-                  disabled={!!modelBusy}
-                  onClick={() => void loadModel({ kind: 'url', url: `${KHRONOS}${sampleId}/glTF-Binary/${sampleId}.glb`, name: sampleId })}
-                >
-                  Unduh &amp; muat {sampleId}
-                </Button>
-                <div className="flex gap-1.5">
-                  <input
-                    value={url}
-                    onChange={(e) => setUrl(e.target.value)}
-                    placeholder="https://…/model.glb"
-                    className="min-w-0 flex-1 rounded-md bg-slate-800 px-2 py-1.5 text-xs text-slate-100 ring-1 ring-white/10 outline-none focus:ring-sky-400"
-                  />
-                  <Button disabled={!url.trim() || !!modelBusy} onClick={() => void loadModel({ kind: 'url', url: url.trim() })}>
-                    Muat
-                  </Button>
-                </div>
-                <Button disabled={!!modelBusy} onClick={() => fileRef.current?.click()}>
-                  Pilih file dari komputer…
-                </Button>
-                <input ref={fileRef} type="file" multiple accept=".glb,.gltf,.bin,.png,.jpg,.jpeg,.webp" hidden onChange={(e) => e.target.files?.length && void loadModel({ kind: 'files', files: Array.from(e.target.files) }).then(() => (e.target.value = ''))} />
-                <div className="text-[10px] text-slate-500">Atau seret file .glb / .gltf (+ .bin &amp; tekstur) langsung ke jendela.</div>
-                {modelBusy && (
-                  <div>
-                    <div className="mb-1 text-[11px] text-slate-400">{modelBusy.label}</div>
-                    <div className="h-1 overflow-hidden rounded-full bg-white/10">
-                      <div className="h-full rounded-full bg-sky-400 transition-all" style={{ width: `${Math.max(5, modelBusy.p * 100)}%` }} />
-                    </div>
-                  </div>
-                )}
-                {modelError && <Note tone="error">{modelError}</Note>}
-              </Section>
-
-              {model && (
-                <>
-                  <Section title="Info model">
-                    <div className="space-y-0.5 text-[11px]">
-                      <div className="truncate font-medium text-slate-100" title={model.name}>
-                        {model.name}
-                      </div>
-                      <Stat k="Mesh" v={String(model.meshes)} />
-                      <Stat k="Segitiga" v={fmtN(model.triangles)} />
-                      <Stat k="Material · tekstur" v={`${model.materials} · ${model.textures}`} />
-                      <Stat k="Lampu · kamera" v={`${model.lights} · ${model.cameras}`} />
-                      <Stat k="Ukuran asli (m)" v={model.size.map((n) => n.toFixed(2)).join(' × ')} />
-                    </div>
-                    {model.warnings.map((w) => (
-                      <Note key={w} tone="warn">
-                        {w}
-                      </Note>
-                    ))}
-                  </Section>
-
-                  <Section title="Tampilan model">
-                    <Slider label="Ukuran di scene" value={s.modelFit} min={1} max={14} step={0.1} onChange={(v) => set('modelFit', v)} fmt={(v) => v.toFixed(1) + ' m'} />
-                    <Toggle label="Tampilkan objek demo" value={s.props} onChange={(v) => set('props', v)} />
-                    {model.lights > 0 && <Toggle label="Lampu dari glTF" value={s.modelLights} onChange={(v) => set('modelLights', v)} />}
-                    <Button variant="danger" onClick={() => { showRef.current?.clearModel(); setModel(null); set('props', true); setPicked(null); }}>
-                      Hapus model
-                    </Button>
-                  </Section>
-
-                  {model.animations.length > 0 && (
-                    <Section title="Animasi">
-                      <Select
-                        label="Clip"
-                        value={clip}
-                        options={[{ label: '— diam —', value: -1 }, ...model.animations.map((a, i) => ({ label: `${a.name} (${a.duration.toFixed(1)}s)`, value: i }))]}
-                        onChange={(v) => {
-                          setClip(v);
-                          showRef.current?.playClip(v);
-                        }}
-                      />
-                      <Slider
-                        label="Kecepatan"
-                        value={clipSpeed}
-                        min={0}
-                        max={3}
-                        step={0.05}
-                        onChange={(v) => {
-                          setClipSpeed(v);
-                          showRef.current?.setClipSpeed(v);
-                        }}
-                        fmt={(v) => '×' + v.toFixed(2)}
-                      />
-                      <Toggle label="Animasi berjalan" value={s.animate} onChange={(v) => set('animate', v)} />
-                    </Section>
-                  )}
-                </>
-              )}
-            </>
-          )}
-
-          {tab === 'object' && (
-            <Section title={picked ? `Objek: ${picked.name}` : 'Editor material'}>
-              {!picked && <Note>Klik objek mana pun di scene untuk memilihnya, lalu ubah materialnya di sini secara langsung.</Note>}
-              {picked && !mat && <Note tone="warn">Objek ini tidak memiliki material PBR yang bisa diedit (instanced / unlit).</Note>}
-              {mat && (
-                <>
-                  <ColorField label="Warna dasar" value={mat.color.getHexString()} onChange={(h) => { mat.color.setStyle(h); bump(); }} />
-                  <Slider label="Roughness" value={mat.roughness} min={0} max={1} step={0.01} onChange={(v) => { mat.roughness = v; bump(); }} />
-                  <Slider label="Metalness" value={mat.metalness} min={0} max={1} step={0.01} onChange={(v) => { mat.metalness = v; bump(); }} />
-                  <Slider label="Clear-coat" value={mat.clearcoat} min={0} max={1} step={0.01} onChange={(v) => { mat.clearcoat = v; bump(); }} />
-                  <Slider label="Clear-coat roughness" value={mat.clearcoatRoughness} min={0} max={1} step={0.01} onChange={(v) => { mat.clearcoatRoughness = v; bump(); }} />
-                  <ColorField label="Warna emisi" value={mat.emissive.getHexString()} onChange={(h) => { mat.emissive.setStyle(h); bump(); }} />
-                  <Slider label="Intensitas emisi" value={mat.emissiveIntensity} min={0} max={30} step={0.1} onChange={(v) => { mat.emissiveIntensity = v; bump(); }} />
-                  <Slider label="Env reflection" value={mat.envMapIntensity} min={0} max={3} step={0.01} onChange={(v) => { mat.envMapIntensity = v; bump(); }} />
-                  {mat.normalMap && <Slider label="Kekuatan normal map" value={mat.normalScale} min={0} max={3} step={0.01} onChange={(v) => { mat.normalScale = v; bump(); }} />}
-                  {mat.transparent && <Slider label="Opasitas" value={mat.opacity} min={0.02} max={1} step={0.01} onChange={(v) => { mat.opacity = v; bump(); }} />}
-                  <div className="pt-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">Lapisan fotorealistik</div>
-                  <Slider label="IOR" value={mat.ior} min={1} max={2.5} step={0.01} onChange={(v) => { mat.ior = v; bump(); }} />
-                  <Slider label="Transmisi (refraksi)" value={mat.transmission} min={0} max={1} step={0.01} onChange={(v) => { mat.transmission = v; bump(); }} />
-                  {mat.transmission > 0 && <Slider label="Ketebalan volume" value={mat.thickness} min={0} max={4} step={0.02} onChange={(v) => { mat.thickness = v; bump(); }} fmt={(v) => v.toFixed(2) + ' m'} />}
-                  <Slider label="Sheen (kain)" value={mat.sheen} min={0} max={1} step={0.01} onChange={(v) => { mat.sheen = v; bump(); }} />
-                  {mat.sheen > 0 && <Slider label="Sheen roughness" value={mat.sheenRoughness} min={0} max={1} step={0.01} onChange={(v) => { mat.sheenRoughness = v; bump(); }} />}
-                  <Slider label="Anisotropy" hint="baja sikat" value={mat.anisotropy} min={-1} max={1} step={0.01} onChange={(v) => { mat.anisotropy = v; bump(); }} />
-                  {mat.anisotropy !== 0 && <Slider label="Rotasi anisotropy" value={mat.anisotropyRotation} min={0} max={3.1416} step={0.01} onChange={(v) => { mat.anisotropyRotation = v; bump(); }} fmt={(v) => ((v * 180) / Math.PI).toFixed(0) + '°'} />}
-                  <Slider label="Iridescence" hint="lapisan tipis" value={mat.iridescence} min={0} max={1} step={0.01} onChange={(v) => { mat.iridescence = v; bump(); }} />
-                  {mat.iridescence > 0 && <Slider label="Tebal film" value={mat.iridescenceThickness} min={80} max={900} step={5} onChange={(v) => { mat.iridescenceThickness = v; bump(); }} fmt={(v) => v.toFixed(0) + ' nm'} />}
-                  <Slider label="Subsurface (lilin/kulit)" value={mat.subsurface} min={0} max={1} step={0.01} onChange={(v) => { mat.subsurface = v; bump(); }} />
-                  {mat.subsurface > 0 && <ColorField label="Warna subsurface" value={mat.subsurfaceColor.getHexString()} onChange={(h) => { mat.subsurfaceColor.setStyle(h); bump(); }} />}
-                  {mat.transmission > 0 && <Slider label="Dispersi" hint="pelangi" value={mat.dispersion} min={0} max={10} step={0.05} onChange={(v) => { mat.dispersion = v; bump(); }} />}
-                  {mat.heightMap && (
-                    <>
-                      <div className="pt-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">Parallax occlusion</div>
-                      <Slider label="Kedalaman relief" value={mat.parallaxScale} min={0} max={0.15} step={0.0025} onChange={(v) => { mat.parallaxScale = v; bump(); }} fmt={(v) => (v * 100).toFixed(1) + ' cm'} />
-                      <Slider label="Self-shadow" value={mat.parallaxSelfShadow} min={0} max={1} step={0.01} onChange={(v) => { mat.parallaxSelfShadow = v; bump(); }} />
-                      <Slider label="Cavity AO" value={mat.parallaxAO} min={0} max={1} step={0.01} onChange={(v) => { mat.parallaxAO = v; bump(); }} />
-                    </>
-                  )}
-                  {mat.waves > 0 && <Slider label="Gelombang air" value={mat.waves} min={0} max={0.12} step={0.002} onChange={(v) => { mat.waves = v; bump(); }} />}
-                </>
-              )}
-            </Section>
-          )}
-        </div>
-      )}
-
-      {/* about modal */}
-      {about && (
-        <div className="absolute inset-0 z-30 grid place-items-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => setAbout(false)}>
-          <div className="max-h-full w-full max-w-4xl overflow-y-auto rounded-2xl bg-slate-900 p-6 ring-1 ring-white/10" onClick={(e) => e.stopPropagation()}>
-            <div className="mb-4 flex items-start justify-between">
-              <div>
-                <h2 className="text-xl font-semibold text-white">Lumina Uber Engine</h2>
-                <p className="text-sm text-slate-400">
-                  Library rendering WebGL2 (Lumina Uber) — realisme ala game engine dengan geometri minimal: GTAO, lampu bola, LOD otomatis, GI dunia + multi-bounce, PCSS, shadow lampu lokal, god rays, eksposur histogram, decal, salju/basah/debu, langit malam, SSGI, POM, refraksi + dispersi. Seluruh kode ada di <code className="text-sky-300">src/lumina/</code>.
-                </p>
-              </div>
-              <button onClick={() => setAbout(false)} className="rounded-md px-2 py-1 text-slate-400 hover:bg-white/10 hover:text-white">
-                ✕
-              </button>
-            </div>
-            <div className="grid gap-5 md:grid-cols-2">
-              <div className="space-y-2.5">
-                {FEATURES.map(([t, d]) => (
-                  <div key={t}>
-                    <div className="text-sm font-medium text-sky-300">{t}</div>
-                    <div className="text-xs leading-relaxed text-slate-400">{d}</div>
-                  </div>
-                ))}
-              </div>
-              <pre className="overflow-x-auto rounded-xl bg-black/50 p-4 text-[11px] leading-relaxed text-emerald-200/90">{SNIPPET}</pre>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {dragging && (
-        <div className="pointer-events-none absolute inset-3 z-40 grid place-items-center rounded-3xl border-2 border-dashed border-sky-400 bg-sky-500/10 backdrop-blur-sm">
-          <div className="rounded-xl bg-slate-950/80 px-6 py-4 text-center">
-            <div className="text-lg font-semibold text-white">Lepaskan untuk memuat model</div>
-            <div className="text-xs text-slate-400">.glb atau .gltf (beserta .bin &amp; tekstur)</div>
-          </div>
-        </div>
-      )}
-
-      {lost && (
-        <div className="absolute inset-0 z-50 grid place-items-center bg-slate-950/80">
-          <Note tone="warn">Konteks WebGL hilang (GPU di-reset). Lumina akan membangun ulang otomatis begitu browser memulihkannya…</Note>
-        </div>
-      )}
-
-      {/* loading / error */}
       {!ready && !error && (
-        <div className="absolute inset-0 z-40 grid place-items-center bg-slate-950">
-          <div className="w-72 text-center">
-            <div className="mb-1 text-lg font-semibold tracking-widest text-white">LUMINA UBER</div>
-            <div className="mb-4 text-xs text-slate-400">{progress.label}</div>
-            <div className="h-1 overflow-hidden rounded-full bg-white/10">
-              <div className="h-full rounded-full bg-gradient-to-r from-sky-400 to-indigo-500 transition-all" style={{ width: `${progress.p * 100}%` }} />
-            </div>
+        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-[radial-gradient(ellipse_at_center,#10182b,#04060c)]">
+          <div className="text-[11px] tracking-[0.5em] text-sky-300/70">LUMINA</div>
+          <div className="bg-gradient-to-r from-sky-300 via-white to-amber-200 bg-clip-text text-7xl font-black tracking-tight text-transparent">X</div>
+          <div className="mt-6 h-1 w-72 overflow-hidden rounded-full bg-white/10">
+            <div className="h-full rounded-full bg-gradient-to-r from-sky-400 to-amber-300 transition-all" style={{ width: `${Math.round(progress.p * 100)}%` }} />
           </div>
+          <div className="mt-3 text-xs text-slate-400">{progress.label}</div>
         </div>
       )}
       {error && (
-        <div className="absolute inset-0 z-40 grid place-items-center bg-slate-950 p-6">
-          <div className="max-w-md rounded-2xl bg-rose-950/40 p-6 text-center ring-1 ring-rose-500/30">
-            <div className="mb-2 text-lg font-semibold text-rose-300">Tidak dapat memulai renderer</div>
-            <p className="text-sm text-slate-300">{error}</p>
-            <p className="mt-3 text-xs text-slate-500">Lumina memerlukan WebGL2 dengan ekstensi EXT_color_buffer_float (HDR).</p>
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/80 p-6">
+          <div className="max-w-md">
+            <Note tone="error">
+              <b>Gagal memulai Lumina X.</b>
+              <br />
+              {error}
+              <br />
+              Pastikan browser mendukung WebGL2 dan ekstensi float-texture (EXT_color_buffer_float).
+            </Note>
           </div>
         </div>
+      )}
+      {lost && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/70">
+          <Note tone="warn">Konteks WebGL hilang – memulihkan…</Note>
+        </div>
+      )}
+
+      {ready && (
+        <>
+          {/* title + clock + mode */}
+          <div className="pointer-events-none absolute left-4 top-4 z-10 space-y-2">
+            <div className="flex items-baseline gap-2 drop-shadow-lg">
+              <span className="text-2xl font-black tracking-tight text-white">LUMINA</span>
+              <span className="bg-gradient-to-r from-sky-300 to-amber-200 bg-clip-text text-3xl font-black text-transparent">X</span>
+              <span className="ml-2 font-mono text-sm text-white/80">{String(stats.clock ?? '')}</span>
+              <span className="font-mono text-[11px] text-white/50">{Number(stats.elev ?? 0).toFixed(0)}° elevasi</span>
+            </div>
+            <div className="pointer-events-auto w-[330px] rounded-xl bg-black/45 p-1 backdrop-blur">
+              <Segmented label="" value={s.mode} options={modes} onChange={(m) => set('mode', m)} />
+            </div>
+          </div>
+
+          {/* HUD */}
+          {hud && (
+            <div className="pointer-events-none absolute bottom-3 left-4 z-10 w-72 rounded-xl bg-black/50 p-3 text-[11px] backdrop-blur">
+              <Stat k="FPS" v={fps.toFixed(0)} warn={fps < 30} />
+              <Stat k="Frame" v={`${Number(stats.ms ?? 0).toFixed(1)} ms`} />
+              <Stat k="GPU" v={Number(stats.gpu) > 0 ? `${Number(stats.gpu).toFixed(1)} ms` : 'n/a'} />
+              <Stat k="Draw calls" v={String(stats.calls ?? 0)} />
+              <Stat k="Segitiga digambar" v={fmtN(Number(stats.tris ?? 0))} />
+              <Stat k="Gedung / mobil / lampu" v={`${stats.buildings} / ${stats.cars} / ${stats.lamps}`} />
+              <Stat k="Segitiga unik (authored)" v={fmtN(Number(stats.authored ?? 0))} />
+              <Stat k="Semua instance" v={fmtN(Number(stats.instanced ?? 0))} />
+              <Stat k="Kota" v={`${Number(stats.size ?? 0) / 1000} × ${Number(stats.size ?? 0) / 1000} km`} />
+              <Stat k="Resolusi" v={String(stats.res ?? '')} />
+            </div>
+          )}
+
+          {toast && <div className="absolute left-1/2 top-6 z-20 -translate-x-1/2 rounded-full bg-black/70 px-4 py-1.5 text-xs backdrop-blur">{toast}</div>}
+
+          <div className="pointer-events-none absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full bg-black/40 px-4 py-1 text-[10px] text-white/60 backdrop-blur">
+            {s.mode === 'fly' ? 'W A S D gerak · Q/E turun/naik · Shift cepat · drag = lihat · roda = kecepatan' : s.mode === 'orbit' ? 'drag = putar · klik kanan = geser · roda = zoom' : 'Gerakan kamera sinematik – sentuh tombol/WASD untuk mengambil alih'} · H = panel · 1–6 = suasana
+          </div>
+
+          <button onClick={() => setPanel((p) => !p)} className="absolute right-3 top-3 z-20 rounded-lg bg-black/55 px-3 py-1.5 text-xs font-medium text-white backdrop-blur hover:bg-black/75">
+            {panel ? 'Sembunyikan ›' : '‹ Pengaturan'}
+          </button>
+
+          {panel && (
+            <aside className="absolute bottom-3 right-3 top-12 z-10 flex w-[350px] max-w-[calc(100vw-1.5rem)] flex-col overflow-hidden rounded-2xl bg-slate-950/88 shadow-2xl ring-1 ring-white/10 backdrop-blur-xl">
+              <div className="space-y-2 border-b border-white/5 p-3">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">Suasana cepat</div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {PRESETS.map((p, i) => (
+                    <button key={p.id} title={p.hint} onClick={() => patch(p.patch)} className="rounded-lg bg-white/6 px-2 py-1.5 text-left text-[11px] font-medium text-slate-200 transition-colors hover:bg-sky-500/30">
+                      <span className="mr-1 text-slate-500">{i + 1}</span>
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  <Button onClick={shot}>📷 Screenshot</Button>
+                  <Button onClick={() => setHud((h) => !h)}>{hud ? 'Sembunyikan HUD' : 'Tampilkan HUD'}</Button>
+                  <Button
+                    variant="danger"
+                    onClick={() => {
+                      setS({ ...DEFAULTS });
+                      say('Pengaturan direset');
+                    }}
+                  >
+                    Reset
+                  </Button>
+                </div>
+              </div>
+              <Tabs value={tab} tabs={TABS as unknown as { id: Tab; label: string }[]} onChange={setTab} />
+              <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+                {tab !== 'engine' &&
+                  GROUPS[tab].map((g) => (
+                    <Section key={g.title} title={g.title} defaultOpen={g.open}>
+                      {g.note && <Note>{g.note}</Note>}
+                      {g.items.map(render)}
+                    </Section>
+                  ))}
+                {tab === 'engine' && (
+                  <>
+                    <Section title="Kualitas (preset)">
+                      <Segmented
+                        label="Preset"
+                        value={s.quality}
+                        options={(Object.keys(QUALITY_PATCH) as QualityId[]).map((q) => ({ label: q, value: q }))}
+                        onChange={(q) => patch({ ...QUALITY_PATCH[q], quality: q })}
+                      />
+                      <Note>Preset mengubah nilai-nilai di bawah secara terlihat; tidak ada penurunan kualitas otomatis di balik layar.</Note>
+                      <Slider label="Render scale" value={s.renderScale} min={0.4} max={1.5} step={0.05} onChange={(v) => set('renderScale', v)} fmt={pct} />
+                      <Select label="MSAA" value={String(s.msaa)} options={[0, 2, 4].map((n) => ({ label: n === 0 ? 'Off (pakai TAA)' : n + '×', value: String(n) }))} onChange={(v) => set('msaa', Number(v))} />
+                    </Section>
+                    <Section title="Navigasi">
+                      <Slider label="Kecepatan terbang" value={s.flySpeed} min={2} max={200} step={1} onChange={(v) => set('flySpeed', v)} fmt={(v) => v.toFixed(0) + ' m/s'} />
+                      <Slider label="Kecepatan rel sinematik" value={s.pathSpeed} min={4} max={80} step={1} onChange={(v) => set('pathSpeed', v)} fmt={(v) => v.toFixed(0) + ' m/s'} />
+                      <div className="flex flex-wrap gap-1.5">
+                        <Button
+                          onClick={() => {
+                            const w = worldRef.current;
+                            if (!w) return;
+                            set('mode', 'fly');
+                            const sz = w.city.stats.size;
+                            w.teleport([0, sz * 0.36, sz * 0.54], [0, 20, 0]);
+                          }}
+                        >
+                          Pandangan udara
+                        </Button>
+                        <Button
+                          onClick={() => {
+                            const w = worldRef.current;
+                            if (!w) return;
+                            set('mode', 'fly');
+                            w.teleport(w.city.start.pos, w.city.start.look);
+                          }}
+                        >
+                          Level jalan
+                        </Button>
+                      </div>
+                    </Section>
+                    <Section title="Tentang Lumina X" defaultOpen>
+                      <Note>
+                        Engine WebGL2 fotorealistik tanpa dependensi. Kota ini ({String(stats.buildings ?? 0)} gedung) digambar dari <b>{String(stats.meshes ?? 0)} mesh instanced</b> dan satu quad ground; jendela, curb, marka jalan dan lampu jendela adalah tekstur + relief parallax, bukan poligon. GPU: {String(stats.gpuName ?? '')}
+                      </Note>
+                    </Section>
+                  </>
+                )}
+              </div>
+            </aside>
+          )}
+        </>
       )}
     </div>
   );

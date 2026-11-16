@@ -73,6 +73,31 @@ export class Sky {
     return 1 / (Math.cos(zenith * DEG2RAD) + 0.50572 * Math.pow(96.07995 - zenith, -1.6364));
   }
 
+  /**
+   * Lumina X – hemispheric sky irradiance (linear RGB, same units as the sun) used as the ambient in-scatter colour of the
+   * volumetric fog: warm near the horizon, blue at noon, deep blue during twilight, a faint moonlit blue at night.
+   * Re-uses one array (do not keep a reference across frames).
+   */
+  getAmbient(): [number, number, number] {
+    const e = this.elevation;
+    const day = this.sunIntensity * 0.22 * smoothstep(-9, 22, e);
+    const warm = 1 - smoothstep(0, 24, e);
+    const twil = 1 - smoothstep(-10, 2, e) * 0 - smoothstep(-2, 6, e);
+    // colour: noon blue → low-sun peach → twilight indigo
+    const r = 0.5 + 0.5 * warm - 0.25 * twil;
+    const g = 0.68 + 0.0 * warm - 0.2 * warm - 0.3 * twil;
+    const b = 1.0 - 0.55 * warm - 0.0 * twil;
+    const cloud = 1 + 0.35 * this.cloudCoverage * Math.min(1, this.cloudDensity);
+    const moon = this.moonLight > 0 ? 0.075 * this.moonLight * Math.min(1, Math.max(0, (-this.sunDirection.y - 0.02) / 0.25)) : 0;
+    const night = 0.02 + moon;
+    const a = this._ambient;
+    a[0] = (day * r + night * 0.45) * cloud;
+    a[1] = (day * g + night * 0.6) * cloud;
+    a[2] = (day * b + night * 1.0) * cloud;
+    return a;
+  }
+  private readonly _ambient: [number, number, number] = [0, 0, 0];
+
   /** Colour/intensity of direct sunlight reaching the ground (irradiance, same units as the sky shader). */
   getSunLight(): { color: Color; intensity: number } {
     const m = Sky.airMass(this.elevation);

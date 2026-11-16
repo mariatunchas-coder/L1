@@ -6,7 +6,7 @@ import { Program } from './Program';
 import { ColorTarget, GBufferTarget, createColorTarget, deleteColorTarget } from './RenderTarget';
 import { fullscreenVert } from './shaders/ibl';
 import { adaptFrag, bloomDownFrag, bloomUpFrag, compositeFrag, histAdaptFrag, histFrag, histVert, lensFlareFrag, lumFrag, gtaoFrag, ssaoBlurFrag, ssaoFrag } from './shaders/post';
-import { volumetricBlurFrag, volumetricFrag } from './shaders/volumetric';
+import { volumetricBlurFrag, volumetricFrag, volumetricTemporalFrag } from './shaders/volumetric';
 import { dofFrag, motionBlurFrag, ssgiApplyFrag, ssgiBlurFrag, ssgiTemporalFrag, ssgiTraceFrag, ssrApplyFrag, ssrTraceFrag, taaFrag } from './shaders/effects';
 import { TEX_CUBE } from './GLState';
 
@@ -152,6 +152,37 @@ export interface PostSettings {
     /** Point / spot lights scatter in the fog too (god rays; shadowed when the light casts shadows). */
     localLights: boolean;
     localIntensity: number;
+    /** Lumina X – amplitude of the animated 3D fbm density wisps (0 = smooth haze … 1 = strongly clumped). */
+    noise: number;
+    /** Lumina X – spatial frequency of the wisps (1/m). */
+    noiseScale: number;
+    /** Lumina X – wind drift of the wisps (m/s, x / z). */
+    windX: number;
+    windZ: number;
+    /** Lumina X – multiple scattering 0 (single scattering) … 1 (three Wrenninge octaves). */
+    multiScatter: number;
+    /** Lumina X – extinction (1/m) of the ground mist layer and its exponential falloff with altitude (1/m). */
+    mistDensity: number;
+    mistFalloff: number;
+    /** Lumina X – sky ambient in-scattering multiplier (the colour follows the sky automatically). */
+    ambient: number;
+    /** Lumina X – fog albedo (tints every in-scattered contribution). */
+    albedo: [number, number, number];
+    /** Lumina X – temporal accumulation weight 0 … 0.95 (reprojected, neighbourhood clamped). */
+    temporal: number;
+    /** Lumina X – ray-march step distribution: 1 = uniform, > 1 = denser near the camera. */
+    stepExponent: number;
+  };
+  /** Lumina X – screen-space rain: three parallax layers of streaks that catch the scene's own light. */
+  rain: {
+    enabled: boolean;
+    intensity: number;
+    /** Horizontal drift of the streaks (−1 … 1). */
+    wind: number;
+    /** Streak length multiplier. */
+    length: number;
+    /** Fall speed multiplier. */
+    speed: number;
   };
 }
 
@@ -203,7 +234,19 @@ export function defaultPostSettings(): PostSettings {
       steps: 24,
       localLights: true,
       localIntensity: 1,
+      noise: 0.55,
+      noiseScale: 0.045,
+      windX: 1.2,
+      windZ: 0.6,
+      multiScatter: 0.7,
+      mistDensity: 0,
+      mistFalloff: 0.25,
+      ambient: 1,
+      albedo: [1, 1, 1],
+      temporal: 0.8,
+      stepExponent: 1.5,
     },
+    rain: { enabled: false, intensity: 0.6, wind: 0.25, length: 1, speed: 1 },
   };
 }
 
@@ -224,6 +267,10 @@ export class PostProcessor {
   private compositeProg: Program;
   private volumetricProg: Program;
   private volumetricBlurProg: Program;
+  private volumetricTemporalProg: Program;
+  private fogHist: ColorTarget[] = [];
+  private fogHistIdx = 0;
+  private fogHistValid = false;
   private taaProg: Program;
   private ssrTraceProg: Program;
   private ssrApplyProg: Program;
@@ -283,6 +330,7 @@ export class PostProcessor {
     this.compositeProg = mk(compositeFrag, 'composite');
     this.volumetricProg = mk(volumetricFrag, 'volumetric');
     this.volumetricBlurProg = mk(volumetricBlurFrag, 'volumetricBlur');
+    this.volumetricTemporalProg = mk(volumetricTemporalFrag, 'volumetricTemporal');
     this.taaProg = mk(taaFrag, 'taa');
     this.ssrTraceProg = mk(ssrTraceFrag, 'ssrTrace');
     this.ssrApplyProg = mk(ssrApplyFrag, 'ssrApply');
@@ -305,7 +353,7 @@ export class PostProcessor {
     const gl = this.gl;
     this.width = w;
     this.height = h;
-    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, this.giTrace, this.giOut, ...this.giHist, ...this.giFull, ...this.fx, ...this.taaHist, ...this.down, ...this.up])
+    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, ...this.fogHist, this.ssrA, this.ssrB, this.flareRT, this.giTrace, this.giOut, ...this.giHist, ...this.giFull, ...this.fx, ...this.taaHist, ...this.down, ...this.up])
       deleteColorTarget(gl, this.state, t);
     this.giTrace = this.giOut = null;
     this.giHist = [];
@@ -325,6 +373,8 @@ export class PostProcessor {
     this.aoB = createColorTarget(gl, this.state, aw, ah, gl.R8);
     this.fogA = createColorTarget(gl, this.state, aw, ah, gl.RGBA16F);
     this.fogB = createColorTarget(gl, this.state, aw, ah, gl.RGBA16F);
+    this.fogHist = [createColorTarget(gl, this.state, aw, ah, gl.RGBA16F), createColorTarget(gl, this.state, aw, ah, gl.RGBA16F)];
+    this.fogHistValid = false;
     let bw = Math.max(1, w >> 1),
       bh = Math.max(1, h >> 1);
     for (let i = 0; i < 7 && bw >= 4 && bh >= 4; i++) {
@@ -404,12 +454,17 @@ export class PostProcessor {
     s: PostSettings['volumetricFog'],
     localLights: number,
     fullW: number,
-    fullH: number
+    fullH: number,
+    time: number,
+    frame: number,
+    ambient: [number, number, number],
+    reset: boolean
   ): WebGLTexture {
     const gl = this.gl;
     const a = this.fogA!,
       b = this.fogB!;
     this.begin();
+    const maxDist = Math.min(s.maxDistance, camera.far);
 
     this.volumetricProg.use();
     const L = this.volumetricProg.loc;
@@ -418,20 +473,45 @@ export class PostProcessor {
     this.state.bindTexture(14, TEX_2D_ARRAY, localShadowTex);
     gl.uniform4f(L.uFogLocal, localLights, Math.max(0, s.localIntensity), 0, 0);
     gl.uniform2f(L.uInvOutSize, 1 / a.width, 1 / a.height);
-    gl.uniform1f(L.uDensity, s.density);
-    gl.uniform1f(L.uHeightFalloff, s.heightFalloff);
+    gl.uniform1f(L.uDensity, Math.max(0, s.density));
+    gl.uniform1f(L.uHeightFalloff, Math.max(0, s.heightFalloff));
     gl.uniform1f(L.uBaseHeight, s.baseHeight);
-    gl.uniform1f(L.uAnisotropy, s.anisotropy);
-    gl.uniform1f(L.uIntensity, s.intensity);
-    gl.uniform1f(L.uMaxDistance, Math.min(s.maxDistance, camera.far));
-    gl.uniform1i(L.uSteps, Math.max(1, Math.min(64, Math.round(s.steps))));
+    gl.uniform1f(L.uAnisotropy, Math.max(-0.95, Math.min(0.95, s.anisotropy)));
+    gl.uniform1f(L.uIntensity, Math.max(0, s.intensity));
+    gl.uniform1f(L.uMaxDistance, maxDist);
+    gl.uniform1i(L.uSteps, Math.max(1, Math.min(96, Math.round(s.steps))));
+    gl.uniform4f(L.uVolA, Math.max(0, Math.min(1, s.noise)), Math.max(0.001, s.noiseScale), s.windX, s.windZ);
+    gl.uniform4f(L.uVolB, time % 3600, Math.max(0, Math.min(1, s.multiScatter)), Math.max(0, s.mistDensity), Math.max(0.001, s.mistFalloff));
+    const am = Math.max(0, s.ambient);
+    gl.uniform4f(L.uVolC, ambient[0] * am, ambient[1] * am, ambient[2] * am, frame % 64);
+    gl.uniform4f(L.uVolD, s.albedo[0], s.albedo[1], s.albedo[2], Math.max(1, Math.min(3, s.stepExponent)));
     this.pass(a, fullW, fullH);
+
+    // temporal accumulation (reprojected history, neighbourhood clamped) – result also becomes the next history
+    let src: ColorTarget = a;
+    if (s.temporal > 0.001 && this.fogHist.length === 2) {
+      const prev = this.fogHist[this.fogHistIdx];
+      const out = this.fogHist[1 - this.fogHistIdx];
+      this.volumetricTemporalProg.use();
+      const TL = this.volumetricTemporalProg.loc;
+      this.state.bindTexture(0, TEX_2D, depthTex);
+      this.state.bindTexture(1, TEX_2D, a.texture);
+      this.state.bindTexture(2, TEX_2D, prev.texture);
+      gl.uniform2f(TL.uInvOutSize, 1 / a.width, 1 / a.height);
+      gl.uniform4f(TL.uTemporal, Math.min(0.95, s.temporal), maxDist, this.fogHistValid && !reset ? 1 : 0, 0);
+      this.pass(out, fullW, fullH);
+      this.fogHistIdx = 1 - this.fogHistIdx;
+      this.fogHistValid = true;
+      src = out;
+    } else {
+      this.fogHistValid = false;
+    }
 
     this.volumetricBlurProg.use();
     const BL = this.volumetricBlurProg.loc;
     gl.uniform2f(BL.uNearFar, camera.near, camera.far);
     this.state.bindTexture(0, TEX_2D, depthTex);
-    this.state.bindTexture(1, TEX_2D, a.texture);
+    this.state.bindTexture(1, TEX_2D, src.texture);
     gl.uniform2f(BL.uDir, 1 / a.width, 0);
     this.pass(b, fullW, fullH);
     this.state.bindTexture(1, TEX_2D, b.texture);
@@ -549,6 +629,11 @@ export class PostProcessor {
   }
 
   /** Drops the SSGI history (call when the effect was not rendered, or after a camera cut). */
+  /** Drops the volumetric-fog history (camera cut, fog switched off). */
+  resetFog(): void {
+    this.fogHistValid = false;
+  }
+
   resetGI(): void {
     this.giValid = false;
     this.giFullValid = false;
@@ -780,6 +865,7 @@ export class PostProcessor {
     gl.uniform1f(L.uFogEnabled, fogTex && s.volumetricFog.enabled ? 1 : 0);
     gl.uniform4f(L.uParams5, flareTex && s.lensFlare.enabled ? Math.max(0, s.lensFlare.intensity) : 0, s.lensDistortion, s.cdl.enabled ? 1 : 0, bloomTex ? Math.max(0, s.halation) : 0);
     gl.uniform4f(L.uParams6, Math.max(0, Math.min(1, s.opticalVignette)), s.bloom.energyConserving ? 1 : 0, s.exposureCompensation, bloomTex ? Math.max(0, s.lensDirt) : 0);
+    gl.uniform4f(L.uRain, s.rain.enabled ? Math.max(0, Math.min(1, s.rain.intensity)) : 0, s.rain.wind, Math.max(0.1, s.rain.length), Math.max(0, s.rain.speed));
     gl.uniform3f(L.uSlope, s.cdl.slope[0], s.cdl.slope[1], s.cdl.slope[2]);
     gl.uniform3f(L.uOffset, s.cdl.offset[0], s.cdl.offset[1], s.cdl.offset[2]);
     gl.uniform3f(L.uPower, Math.max(0.05, s.cdl.power[0]), Math.max(0.05, s.cdl.power[1]), Math.max(0.05, s.cdl.power[2]));
@@ -788,7 +874,7 @@ export class PostProcessor {
 
   dispose(): void {
     const gl = this.gl;
-    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, this.ssrA, this.ssrB, this.flareRT, this.lum, this.giTrace, this.giOut, ...this.giHist, ...this.giFull, this.hist, ...this.fx, ...this.taaHist, ...this.adapt, ...this.down, ...this.up])
+    for (const t of [this.aoA, this.aoB, this.fogA, this.fogB, ...this.fogHist, this.ssrA, this.ssrB, this.flareRT, this.lum, this.giTrace, this.giOut, ...this.giHist, ...this.giFull, this.hist, ...this.fx, ...this.taaHist, ...this.adapt, ...this.down, ...this.up])
       deleteColorTarget(gl, this.state, t);
     this.voxel?.dispose();
     for (const p of [
@@ -803,6 +889,7 @@ export class PostProcessor {
       this.compositeProg,
       this.volumetricProg,
       this.volumetricBlurProg,
+      this.volumetricTemporalProg,
       this.taaProg,
       this.ssrTraceProg,
       this.ssrApplyProg,

@@ -1,6 +1,8 @@
 /**
  * Lumina – a performance-first, physically based WebGL2 rendering engine.
  *
+ * Lumina X: Volumetric Fog X (animated 3D density, multi-scatter, ground mist, sky ambient, temporal accumulation), screen-space
+ * rain + global wetness, astronomical TimeOfDay, FlyControls / CameraPath, ultra-lean urban primitives and parallax facades.
  * Lumina Uber: GTAO, sphere area lights, automatic LOD generation (quadric-error clustering), snow layer, night sky
  * (stars / moon / moonlight), film halation + lens dirt.
  * Lumina 4: world-space radiance cache + multi-bounce SSGI, PCSS soft shadows, spot / point light shadow atlas,
@@ -52,6 +54,14 @@ export type { RendererOptions, RenderInfo } from './renderer/Renderer';
 export { defaultPostSettings } from './renderer/PostProcessor';
 export type { PostSettings, ToneMapping } from './renderer/PostProcessor';
 export { OrbitControls } from './controls/OrbitControls';
+export { FlyControls } from './controls/FlyControls';
+export { CameraPath } from './controls/CameraPath';
+export type { CameraKey } from './controls/CameraPath';
+export { TimeOfDay } from './core/TimeOfDay';
+export { createBuildingGeometry, createCarGeometry, createLampGeometry, createTreeGeometry, buildingSize, makeRng } from './geometry/Architecture';
+export type { BuildingSpec, BuildingTier } from './geometry/Architecture';
+export { createFacade, createRoadTile, createLeaves, FACADE, ROAD } from './textures/Urban';
+export type { FacadeSet } from './textures/Urban';
 export { applyQuality, AdaptiveQuality, QUALITY_LEVELS } from './quality/Quality';
 export { createDetailMap } from './textures/Detail';
 export type { LocalShadowSettings } from './renderer/LocalShadows';

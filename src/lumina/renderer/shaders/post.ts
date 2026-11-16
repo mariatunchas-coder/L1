@@ -409,6 +409,7 @@ uniform vec4 uParams2;     // x auto exposure, y key, z min lum, w max lum
 uniform vec2 uParams3;     // x time, y aspect
 uniform vec2 uParams4;     // x sharpen, y temperature (-1 cool … +1 warm)
 uniform float uFogEnabled;
+uniform vec4 uRain;        // x intensity (0 = off), y wind, z streak length, w fall speed
 in vec2 vUv;
 out vec4 fragColor;
 
@@ -490,6 +491,28 @@ float lensDirtMask(vec2 uv, float aspect) {
   }
   return clamp(smudge * 0.8 + spk, 0.0, 1.0);
 }
+
+// Lumina X – rain: three parallax layers of falling streaks (near → far: thicker, longer, faster → thin, short, slow).
+// Each streak is lit by what is behind it (the scene colour and the bloom of nearby lamps), so rain glows in light cones
+// and disappears in the dark exactly like in real footage.
+float rainLayer(vec2 uv, float aspect, float t, float cols, float rows, float speed, float len, float wind, float seed, float density) {
+  vec2 p = vec2(uv.x * aspect, uv.y);
+  p.x += p.y * wind;
+  float cx = p.x * cols;
+  float id = floor(cx);
+  float fx = fract(cx);
+  float rnd = dHash(vec2(id, seed));
+  float y = p.y * rows + t * speed * (0.75 + rnd * 0.5) + dHash(vec2(id, seed + 9.1)) * 17.0;
+  float cell = floor(y);
+  float fy = fract(y);
+  float r3 = dHash(vec2(id * 7.0 + cell * 1.3, seed + 3.3));
+  float on = step(1.0 - density, r3);
+  float xpos = 0.3 + 0.4 * dHash(vec2(id + cell * 13.1, seed + 5.5));
+  float w = max(fwidth(cx) * 0.9, 0.04);
+  float h = 1.0 - smoothstep(0.0, w, abs(fx - xpos));
+  float trail = pow(1.0 - smoothstep(0.0, len, fy), 1.6);
+  return on * h * trail;
+}
 vec3 toSRGB(vec3 c) {
   c = clamp(c, 0.0, 1.0);
   return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
@@ -536,6 +559,17 @@ void main() {
   if (uParams5.w > 0.0) col += bloomC * vec3(1.0, 0.22, 0.06) * uParams5.w * 0.6;   // film halation
   if (uParams6.w > 0.0) col += bloomC * lensDirtMask(uv, uParams3.y) * uParams6.w * 2.5;   // dirty lens
   if (uParams5.x > 0.0) col += texture(uTex4, uv).rgb * uParams5.x;
+  if (uRain.x > 0.0) {
+    float t = uParams3.x;
+    float dens = 0.05 + 0.3 * uRain.x;
+    float streak = rainLayer(uv, uParams3.y, t, 95.0, 4.0, 3.4 * uRain.w, 0.42 * uRain.z, uRain.y, 1.0, dens)
+                 + 0.7 * rainLayer(uv, uParams3.y, t, 130.0, 7.0, 2.6 * uRain.w, 0.36 * uRain.z, uRain.y, 2.0, dens)
+                 + 0.45 * rainLayer(uv, uParams3.y, t, 240.0, 12.0, 1.9 * uRain.w, 0.3 * uRain.z, uRain.y, 3.0, dens);
+    float avgL = max(texture(uTex2, vec2(0.5)).r, 1e-3);
+    vec3 lit = col * 0.35 + bloomC * 7.0 + vec3(0.55, 0.62, 0.72) * avgL * 0.9;
+    col += lit * streak * (0.2 + 0.4 * uRain.x);
+    col *= 1.0 - 0.06 * uRain.x;    // wet air: slight contrast loss
+  }
   col *= vec3(1.0 + 0.22 * uParams4.y, 1.0 + 0.02 * uParams4.y, 1.0 - 0.22 * uParams4.y);
 
   float exposure = uParams0.x;
