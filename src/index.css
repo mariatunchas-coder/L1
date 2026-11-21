@@ -1,1 +1,104 @@
 @import "tailwindcss";
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: #0e1014;
+  overscroll-behavior: none;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+canvas.viewport {
+  touch-action: none;
+  display: block;
+  width: 100%;
+  height: 100%;
+  outline: none;
+}
+
+/* range slider */
+input.range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 26px;
+  background: transparent;
+  margin: 0;
+  cursor: pointer;
+}
+input.range:focus {
+  outline: none;
+}
+input.range::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(to right, #7c9cff var(--p), #2b303c var(--p));
+}
+input.range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 20px;
+  width: 20px;
+  margin-top: -7px;
+  border-radius: 50%;
+  background: #f4f6ff;
+  border: 2px solid #7c9cff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+input.range::-moz-range-track {
+  height: 6px;
+  border-radius: 3px;
+  background: #2b303c;
+}
+input.range::-moz-range-progress {
+  height: 6px;
+  border-radius: 3px;
+  background: #7c9cff;
+}
+input.range::-moz-range-thumb {
+  height: 16px;
+  width: 16px;
+  border-radius: 50%;
+  background: #f4f6ff;
+  border: 2px solid #7c9cff;
+}
+
+.thin-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: #2d3340;
+  border-radius: 3px;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  scrollbar-width: none;
+}
+
+input[type="color"] {
+  -webkit-appearance: none;
+  appearance: none;
+  border: none;
+  padding: 0;
+  background: none;
+  cursor: pointer;
+}
+input[type="color"]::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+input[type="color"]::-webkit-color-swatch {
+  border: 2px solid #3a4150;
+  border-radius: 8px;
+}
